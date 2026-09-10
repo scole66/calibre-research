@@ -1,0 +1,14 @@
+database: ~/.local/share/calibre-research/research.sqlite3
+rubric: ./config/rubric-1.0.yaml
+
+research:
+  provider: stub
+  max_cost_per_run_usd: 5.00
+  max_cost_per_book_usd: 0.10
+  web_search_enabled: true
+  reuse_cached_evidence: true
+
+calibre:
+  library: null
+  auto_apply_confidence: 0.98
+  review_confidence: 0.80

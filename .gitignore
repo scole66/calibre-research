@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local runtime state
+*.sqlite
+*.sqlite3
+*.db
+
+# Secrets / local config
+.env
+.env.*
+config.local.yaml
+
+# macOS
+.DS_Store

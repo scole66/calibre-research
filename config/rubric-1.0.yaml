@@ -1,0 +1,20 @@
+version: "1.0"
+components:
+  major_awards:
+    max: 25
+    rules:
+      win: 8
+      nomination: 3
+  critical_reputation:
+    max: 20
+  author_significance:
+    max: 15
+  reader_reception:
+    max: 10
+  historical_interest:
+    max: 10
+  personal_interest:
+    max: 15
+    default: 7
+  discovery_bonus:
+    max: 5
