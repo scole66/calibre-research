@@ -216,28 +216,32 @@ def metadata(
         _print_metadata_header(edition)
 
         if candidate is None:
-            no_match += 1
-            classification = classify_unresolved(edition)
-            db.record_metadata_issue(
-                edition_id=edition["edition_id"],
-                classification=classification,
-                provider=None,
-                reason="No configured metadata provider produced a confident match",
-            )
-            for provider_name, error in provider_errors:
-                db.record_metadata_issue(
-                    edition_id=edition["edition_id"],
-                    classification="PROVIDER_ERROR",
-                    provider=provider_name,
-                    reason=error,
-                )
             if provider_errors:
                 failed += 1
                 for provider_name, error in provider_errors:
+                    db.record_metadata_issue(
+                        edition_id=edition["edition_id"],
+                        classification="PROVIDER_ERROR",
+                        provider=provider_name,
+                        reason=error,
+                    )
                     console.print(f"  [red]{provider_name} error:[/red] {error}")
-            console.print(
-                f"  [yellow]No confident metadata match[/yellow] [dim]({classification})[/dim]"
-            )
+                console.print(
+                    "  [yellow]Metadata lookup incomplete because a provider failed; "
+                    "this edition remains eligible for retry.[/yellow]"
+                )
+            else:
+                no_match += 1
+                classification = classify_unresolved(edition)
+                db.record_metadata_issue(
+                    edition_id=edition["edition_id"],
+                    classification=classification,
+                    provider=None,
+                    reason="No configured metadata provider produced a confident match",
+                )
+                console.print(
+                    f"  [yellow]No confident metadata match[/yellow] [dim]({classification})[/dim]"
+                )
             continue
 
         assert lookup_id is not None

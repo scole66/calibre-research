@@ -9,6 +9,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
+from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_random_exponential
+
 from .metadata import MetadataCandidate, normalize_text
 from .models import ResearchResult
 
@@ -16,6 +18,10 @@ USER_AGENT_BASE = "calibre-research/0.1 (+https://github.com/scole66/calibre-res
 
 
 class ProviderError(RuntimeError):
+    pass
+
+
+class RetryableProviderError(ProviderError):
     pass
 
 
@@ -82,48 +88,39 @@ class HttpJsonProvider(MetadataProvider):
         if elapsed < minimum_interval:
             time.sleep(minimum_interval - elapsed)
 
-    def _retry_delay(self, attempt: int, exc: HTTPError | None = None) -> float:
-        if exc is not None and exc.headers is not None:
-            retry_after = exc.headers.get("Retry-After")
-            if retry_after:
-                try:
-                    return max(0.0, float(retry_after))
-                except ValueError:
-                    pass
-        return min(8.0, 1.0 * (2**attempt))
-
     def _safe_url(self, url: str) -> str:
         return url
 
     def _get_json(self, url: str) -> JsonResponse | None:
+        retrying = Retrying(
+            stop=stop_after_attempt(self.max_retries + 1),
+            wait=wait_random_exponential(multiplier=1.0, max=30.0),
+            retry=retry_if_exception_type(RetryableProviderError),
+            reraise=True,
+        )
+        return retrying(self._get_json_once, url)
+
+    def _get_json_once(self, url: str) -> JsonResponse | None:
         request = Request(
             url,
             headers={"User-Agent": self.user_agent, "Accept": "application/json"},
         )
-        for attempt in range(self.max_retries + 1):
-            self._wait_for_rate_limit()
-            try:
-                self._last_request_at = time.monotonic()
-                with urlopen(request, timeout=self.timeout) as response:
-                    return JsonResponse(url=response.geturl(), data=json.load(response))
-            except HTTPError as exc:
-                if exc.code == 404:
-                    return None
-                if exc.code == 429 or 500 <= exc.code < 600:
-                    if attempt < self.max_retries:
-                        time.sleep(self._retry_delay(attempt, exc))
-                        continue
-                raise ProviderError(
-                    f"{self.name} returned HTTP {exc.code} for {self._safe_url(url)}"
-                ) from exc
-            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-                if attempt < self.max_retries:
-                    time.sleep(self._retry_delay(attempt))
-                    continue
-                raise ProviderError(
-                    f"{self.name} request failed for {self._safe_url(url)}: {exc}"
-                ) from exc
-        raise AssertionError("unreachable")
+        self._wait_for_rate_limit()
+        try:
+            self._last_request_at = time.monotonic()
+            with urlopen(request, timeout=self.timeout) as response:
+                return JsonResponse(url=response.geturl(), data=json.load(response))
+        except HTTPError as exc:
+            if exc.code == 404:
+                return None
+            message = f"{self.name} returned HTTP {exc.code} for {self._safe_url(url)}"
+            if exc.code == 429 or 500 <= exc.code < 600:
+                raise RetryableProviderError(message) from exc
+            raise ProviderError(message) from exc
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise RetryableProviderError(
+                f"{self.name} request failed for {self._safe_url(url)}: {exc}"
+            ) from exc
 
 
 class OpenLibraryProvider(HttpJsonProvider):

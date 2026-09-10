@@ -453,3 +453,63 @@ def test_metadata_command_falls_back_in_configured_order(tmp_path: Path, monkeyp
     assert result.exit_code == 0, result.output
     assert calls == ["openlibrary", "googlebooks"]
     assert "googlebooks: confidence=0.95" in result.output
+
+
+def test_http_provider_retries_retryable_error(monkeypatch):
+    from calibre_research.providers import OpenLibraryProvider, RetryableProviderError
+
+    provider = OpenLibraryProvider(
+        base_url="https://openlibrary.org",
+        timeout=15.0,
+        contact=None,
+        max_retries=2,
+        anonymous_requests_per_second=1.0,
+        identified_requests_per_second=3.0,
+    )
+    calls = []
+
+    def fake_once(url: str):
+        calls.append(url)
+        if len(calls) < 3:
+            raise RetryableProviderError("temporary")
+        return None
+
+    monkeypatch.setattr(provider, "_get_json_once", fake_once)
+    # Remove Tenacity wait time from the unit test while leaving production
+    # exponential+jitter behavior intact.
+    monkeypatch.setattr(
+        "calibre_research.providers.wait_random_exponential", lambda **kwargs: lambda retry_state: 0
+    )
+
+    # _get_json constructs its Retrying object at call time.
+    assert provider._get_json("https://example.invalid") is None
+    assert len(calls) == 3
+
+
+def test_http_provider_stops_after_configured_retries(monkeypatch):
+    from calibre_research.providers import OpenLibraryProvider, RetryableProviderError
+
+    provider = OpenLibraryProvider(
+        base_url="https://openlibrary.org",
+        timeout=15.0,
+        contact=None,
+        max_retries=1,
+        anonymous_requests_per_second=1.0,
+        identified_requests_per_second=3.0,
+    )
+    calls = []
+
+    def fake_once(url: str):
+        calls.append(url)
+        raise RetryableProviderError("temporary")
+
+    monkeypatch.setattr(provider, "_get_json_once", fake_once)
+    monkeypatch.setattr(
+        "calibre_research.providers.wait_random_exponential", lambda **kwargs: lambda retry_state: 0
+    )
+
+    import pytest
+
+    with pytest.raises(RetryableProviderError):
+        provider._get_json("https://example.invalid")
+    assert len(calls) == 2

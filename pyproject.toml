@@ -13,6 +13,7 @@ dependencies = [
   "pydantic>=2.8",
   "PyYAML>=6.0",
   "rich>=13.7",
+  "tenacity>=9.0",
 ]
 
 [project.optional-dependencies]
