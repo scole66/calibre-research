@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 import os
+from pathlib import Path
+
 import yaml
 from pydantic import BaseModel, Field
 
@@ -16,6 +17,7 @@ class ResearchConfig(BaseModel):
 
 class CalibreConfig(BaseModel):
     library: str | None = None
+    executable: str | None = None
     auto_apply_confidence: float = 0.98
     review_confidence: float = 0.80
 
@@ -31,8 +33,20 @@ class AppConfig(BaseModel):
         return Path(os.path.expanduser(self.database)).resolve()
 
 
-def load_config(path: Path | None) -> AppConfig:
-    if path is None:
-        return AppConfig()
-    data = yaml.safe_load(path.read_text()) or {}
+def load_config(config_path: str | None = None) -> AppConfig:
+    if config_path is not None:
+        path = Path(config_path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"Config file does not exist: {path}")
+
+        data = yaml.safe_load(path.read_text()) or {}
+
+    else:
+        default_path = Path.cwd() / "config.yaml"
+
+        if default_path.exists():
+            data = yaml.safe_load(default_path.read_text()) or {}
+        else:
+            data = {}
     return AppConfig.model_validate(data)

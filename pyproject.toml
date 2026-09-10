@@ -26,3 +26,15 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 calibre_research = ["schema.sql"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.6",
+]

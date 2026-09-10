@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
-import sqlite3
-
-from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -16,6 +15,7 @@ class UpsertResult:
     @property
     def ok(self) -> bool:
         return self.work_id is not None
+
 
 class Database:
     def __init__(self, path: Path):
@@ -89,7 +89,7 @@ class Database:
             #     book.get("series_index"),
             #     book.get("languages"),
             # )
-            # 
+            #
             # for i, value in enumerate(params, start=1):
             #     print(i, repr(value), type(value))
 
@@ -135,6 +135,7 @@ def _float_or_none(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
 
 def scalar_text(value) -> str | None:
     if value is None:
