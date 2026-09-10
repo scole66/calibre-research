@@ -124,11 +124,29 @@ def metadata(
 
     provider_name = provider or cfg.metadata.provider
     try:
-        metadata_provider = make_metadata_provider(provider_name)
+        metadata_provider = make_metadata_provider(
+            provider_name,
+            openlibrary_contact=cfg.metadata.openlibrary_contact,
+            openlibrary_timeout=cfg.metadata.openlibrary_timeout_seconds,
+            openlibrary_max_retries=cfg.metadata.openlibrary_max_retries,
+        )
     except ValueError as exc:
         raise typer.Exit(code=_print_error(str(exc))) from exc
 
-    rows = db.metadata_candidates(provider=provider_name, limit=limit)
+    effective_limit = limit
+    if provider_name == "openlibrary":
+        max_books = cfg.metadata.openlibrary_max_books_per_run
+        if effective_limit is None:
+            effective_limit = max_books
+        elif effective_limit > max_books:
+            raise typer.Exit(
+                code=_print_error(
+                    f"Open Library runs are capped at {max_books} books by configuration; "
+                    "raise metadata.openlibrary_max_books_per_run explicitly if appropriate"
+                )
+            )
+
+    rows = db.metadata_candidates(provider=provider_name, limit=effective_limit)
     if not rows:
         console.print("No editions to research.")
         return

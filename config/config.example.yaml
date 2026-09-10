@@ -11,6 +11,13 @@ research:
 metadata:
   provider: openlibrary
   reuse_cached_lookups: true
+  # Open Library asks frequent API clients to include contact information.
+  # Keep personal contact details in config.yaml, not in this committed example.
+  openlibrary_contact: null
+  # Guardrail against accidentally turning a metadata run into bulk harvesting.
+  openlibrary_max_books_per_run: 25
+  openlibrary_timeout_seconds: 15.0
+  openlibrary_max_retries: 2
 
 calibre:
   library: null

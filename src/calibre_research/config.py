@@ -18,6 +18,10 @@ class ResearchConfig(BaseModel):
 class MetadataConfig(BaseModel):
     provider: str = "openlibrary"
     reuse_cached_lookups: bool = True
+    openlibrary_contact: str | None = None
+    openlibrary_max_books_per_run: int = 25
+    openlibrary_timeout_seconds: float = 15.0
+    openlibrary_max_retries: int = 2
 
 
 class CalibreConfig(BaseModel):
