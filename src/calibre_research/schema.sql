@@ -109,3 +109,32 @@ CREATE TABLE IF NOT EXISTS review_queue (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     resolved_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS metadata_lookups (
+    id INTEGER PRIMARY KEY,
+    edition_id INTEGER NOT NULL REFERENCES editions(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    query_key TEXT NOT NULL,
+    source_url TEXT,
+    identity_confidence REAL,
+    raw_json TEXT NOT NULL,
+    normalized_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'MATCH',
+    retrieved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(edition_id, provider, query_key)
+);
+
+CREATE TABLE IF NOT EXISTS metadata_proposals (
+    id INTEGER PRIMARY KEY,
+    edition_id INTEGER NOT NULL REFERENCES editions(id) ON DELETE CASCADE,
+    lookup_id INTEGER NOT NULL REFERENCES metadata_lookups(id) ON DELETE CASCADE,
+    field_name TEXT NOT NULL,
+    current_value_json TEXT,
+    proposed_value_json TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PROPOSED',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(edition_id, field_name, status)
+);

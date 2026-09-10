@@ -15,6 +15,15 @@ class ResearchConfig(BaseModel):
     reuse_cached_evidence: bool = True
 
 
+class MetadataConfig(BaseModel):
+    provider: str = "openlibrary"
+    reuse_cached_lookups: bool = True
+    openlibrary_contact: str | None = None
+    openlibrary_max_books_per_run: int = 25
+    openlibrary_timeout_seconds: float = 15.0
+    openlibrary_max_retries: int = 2
+
+
 class CalibreConfig(BaseModel):
     library: str | None = None
     executable: str | None = None
@@ -26,6 +35,7 @@ class AppConfig(BaseModel):
     database: str = "~/.local/share/calibre-research/research.sqlite3"
     rubric: str = "./config/rubric-1.0.yaml"
     research: ResearchConfig = Field(default_factory=ResearchConfig)
+    metadata: MetadataConfig = Field(default_factory=MetadataConfig)
     calibre: CalibreConfig = Field(default_factory=CalibreConfig)
 
     @property
@@ -33,20 +43,14 @@ class AppConfig(BaseModel):
         return Path(os.path.expanduser(self.database)).resolve()
 
 
-def load_config(config_path: str | None = None) -> AppConfig:
+def load_config(config_path: str | Path | None = None) -> AppConfig:
     if config_path is not None:
         path = Path(config_path)
-
         if not path.exists():
             raise FileNotFoundError(f"Config file does not exist: {path}")
-
         data = yaml.safe_load(path.read_text()) or {}
-
     else:
         default_path = Path.cwd() / "config.yaml"
+        data = yaml.safe_load(default_path.read_text()) or {} if default_path.exists() else {}
 
-        if default_path.exists():
-            data = yaml.safe_load(default_path.read_text()) or {}
-        else:
-            data = {}
     return AppConfig.model_validate(data)

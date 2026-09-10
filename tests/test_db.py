@@ -11,7 +11,7 @@ def test_initialize_and_upsert(tmp_path: Path):
         {
             "id": "1",
             "title": "Dreamsnake",
-            "authors": "Vonda N. McIntyre",
+            "authors": ["Vonda N. McIntyre"],
             "pubdate": "2019-04-16",
         },
     )
