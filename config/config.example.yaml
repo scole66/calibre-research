@@ -9,15 +9,32 @@ research:
   reuse_cached_evidence: true
 
 metadata:
-  provider: openlibrary
+  # Providers are tried in order. Later providers are fallbacks for unresolved records.
+  providers:
+    - openlibrary
+    - googlebooks
   reuse_cached_lookups: true
-  # Open Library asks frequent API clients to include contact information.
-  # Keep personal contact details in config.yaml, not in this committed example.
-  openlibrary_contact: null
-  # Guardrail against accidentally turning a metadata run into bulk harvesting.
-  openlibrary_max_books_per_run: 25
-  openlibrary_timeout_seconds: 15.0
-  openlibrary_max_retries: 2
+
+  openlibrary:
+    base_url: https://openlibrary.org
+    # Open Library asks frequent API clients to include contact information.
+    # Keep personal contact details in config.yaml, not in this committed example.
+    contact: null
+    # Guardrail against accidentally turning a metadata run into bulk harvesting.
+    max_books_per_run: 25
+    timeout_seconds: 15.0
+    max_retries: 2
+    anonymous_requests_per_second: 1.0
+    identified_requests_per_second: 3.0
+
+  googlebooks:
+    base_url: https://www.googleapis.com/books/v1
+    # Optional. Public volume search works without a key, but a key may be useful
+    # if Google Books quota policy changes or your usage grows.
+    api_key: null
+    timeout_seconds: 15.0
+    max_retries: 2
+    requests_per_second: 2.0
 
 calibre:
   library: null

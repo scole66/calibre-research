@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 UNKNOWN_DATE_PREFIX = "0101-01-01"
+SUSPICIOUS_VALUES = {"unknown", "unknown author", "unknown title", "n/a", "none"}
 
 
 @dataclass(frozen=True)
@@ -152,3 +153,17 @@ def candidate_from_normalized(
         series_index=data.get("series_index"),
         raw=raw,
     )
+
+
+def classify_unresolved(edition: dict[str, Any], *, provider_error: bool = False) -> str:
+    if provider_error:
+        return "PROVIDER_ERROR"
+
+    title = normalize_text(str(edition.get("title") or ""))
+    author = normalize_text(str(edition.get("author") or ""))
+
+    if not title or title in SUSPICIOUS_VALUES:
+        return "MISSING_OR_SUSPICIOUS_TITLE"
+    if not author or author in SUSPICIOUS_VALUES:
+        return "MISSING_OR_SUSPICIOUS_AUTHOR"
+    return "UNMATCHED_GENERIC"

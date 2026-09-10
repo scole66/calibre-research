@@ -270,6 +270,37 @@ class Database:
                     ),
                 )
 
+    def record_metadata_issue(
+        self,
+        *,
+        edition_id: int,
+        classification: str,
+        provider: str | None,
+        reason: str,
+    ) -> None:
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT INTO metadata_issues(edition_id, classification, provider, reason)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(edition_id, classification, provider, status) DO UPDATE SET
+                    reason=excluded.reason,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (edition_id, classification, provider or "", reason),
+            )
+
+    def resolve_metadata_issues(self, *, edition_id: int) -> None:
+        with self.connect() as con:
+            con.execute(
+                """
+                UPDATE metadata_issues
+                SET status='RESOLVED', updated_at=CURRENT_TIMESTAMP
+                WHERE edition_id=? AND status='OPEN'
+                """,
+                (edition_id,),
+            )
+
 
 def _scalar_text(value: Any) -> str | None:
     if value is None:

@@ -15,13 +15,29 @@ class ResearchConfig(BaseModel):
     reuse_cached_evidence: bool = True
 
 
+class OpenLibraryConfig(BaseModel):
+    base_url: str
+    contact: str | None = None
+    max_books_per_run: int
+    timeout_seconds: float
+    max_retries: int
+    anonymous_requests_per_second: float
+    identified_requests_per_second: float
+
+
+class GoogleBooksConfig(BaseModel):
+    base_url: str
+    api_key: str | None = None
+    timeout_seconds: float
+    max_retries: int
+    requests_per_second: float
+
+
 class MetadataConfig(BaseModel):
-    provider: str = "openlibrary"
+    providers: list[str] = Field(default_factory=list)
     reuse_cached_lookups: bool = True
-    openlibrary_contact: str | None = None
-    openlibrary_max_books_per_run: int = 25
-    openlibrary_timeout_seconds: float = 15.0
-    openlibrary_max_retries: int = 2
+    openlibrary: OpenLibraryConfig | None = None
+    googlebooks: GoogleBooksConfig | None = None
 
 
 class CalibreConfig(BaseModel):

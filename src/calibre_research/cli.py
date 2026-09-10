@@ -12,7 +12,7 @@ from rich.table import Table
 from .calibre import CalibreError, scan_library
 from .config import load_config
 from .db import Database
-from .metadata import build_proposals, candidate_from_normalized
+from .metadata import build_proposals, candidate_from_normalized, classify_unresolved
 from .providers import ProviderError, make_metadata_provider, metadata_query_key
 
 app = typer.Typer(no_args_is_help=True)
@@ -122,31 +122,36 @@ def metadata(
     db = _db(cfg.database_path)
     db.initialize()
 
-    provider_name = provider or cfg.metadata.provider
-    try:
-        metadata_provider = make_metadata_provider(
-            provider_name,
-            openlibrary_contact=cfg.metadata.openlibrary_contact,
-            openlibrary_timeout=cfg.metadata.openlibrary_timeout_seconds,
-            openlibrary_max_retries=cfg.metadata.openlibrary_max_retries,
-        )
-    except ValueError as exc:
-        raise typer.Exit(code=_print_error(str(exc))) from exc
+    provider_names = [provider] if provider else cfg.metadata.providers
+    if not provider_names:
+        raise typer.Exit(code=_print_error("No metadata providers are configured"))
+
+    providers = []
+    for provider_name in provider_names:
+        try:
+            provider_settings = getattr(cfg.metadata, provider_name, None)
+            if provider_settings is None:
+                raise ValueError(
+                    f"metadata provider {provider_name!r} has no configuration section"
+                )
+            providers.append(make_metadata_provider(provider_name, provider_settings.model_dump()))
+        except (AttributeError, ValueError) as exc:
+            raise typer.Exit(code=_print_error(str(exc))) from exc
 
     effective_limit = limit
-    if provider_name == "openlibrary":
-        max_books = cfg.metadata.openlibrary_max_books_per_run
+    if "openlibrary" in provider_names:
+        max_books = cfg.metadata.openlibrary.max_books_per_run
         if effective_limit is None:
             effective_limit = max_books
         elif effective_limit > max_books:
             raise typer.Exit(
                 code=_print_error(
                     f"Open Library runs are capped at {max_books} books by configuration; "
-                    "raise metadata.openlibrary_max_books_per_run explicitly if appropriate"
+                    "raise metadata.openlibrary.max_books_per_run explicitly if appropriate"
                 )
             )
 
-    rows = db.metadata_candidates(provider=provider_name, limit=effective_limit)
+    rows = db.metadata_candidates(provider=provider_names[0], limit=effective_limit)
     if not rows:
         console.print("No editions to research.")
         return
@@ -164,27 +169,27 @@ def metadata(
         candidate = None
         lookup_id = None
         used_cache = False
+        provider_errors: list[tuple[str, str]] = []
 
-        if cfg.metadata.reuse_cached_lookups and not refresh:
-            cached = db.cached_metadata_lookup(
-                edition_id=edition["edition_id"],
-                provider=provider_name,
-                query_key=query_key,
-            )
+        for metadata_provider in providers:
+            provider_name = metadata_provider.name
+            cached = None
+            if cfg.metadata.reuse_cached_lookups and not refresh:
+                cached = db.cached_metadata_lookup(
+                    edition_id=edition["edition_id"],
+                    provider=provider_name,
+                    query_key=query_key,
+                )
+
             if cached is not None:
-                used_cache = True
                 cached_count += 1
                 if cached["status"] == "NO_MATCH":
-                    no_match += 1
-                    _print_metadata_header(edition)
-                    console.print(
-                        "  [yellow]No confident metadata match[/yellow] [dim](cached)[/dim]"
-                    )
                     continue
                 candidate = candidate_from_normalized(cached["normalized"], raw=cached["raw"])
                 lookup_id = cached["id"]
+                used_cache = True
+                break
 
-        if candidate is None:
             try:
                 candidate = metadata_provider.lookup(
                     title=edition["title"],
@@ -192,28 +197,52 @@ def metadata(
                     isbn=edition["isbn"],
                 )
             except ProviderError as exc:
-                failed += 1
-                _print_metadata_header(edition)
-                console.print(f"  [red]provider error:[/red] {exc}")
+                provider_errors.append((provider_name, str(exc)))
                 continue
 
             if candidate is None:
-                no_match += 1
                 db.store_metadata_miss(
                     edition_id=edition["edition_id"],
                     provider=provider_name,
                     query_key=query_key,
                 )
-                _print_metadata_header(edition)
-                console.print("  [yellow]No confident metadata match[/yellow]")
                 continue
 
             lookup_id = db.store_metadata_lookup(
                 edition_id=edition["edition_id"], candidate=candidate
             )
+            break
+
+        _print_metadata_header(edition)
+
+        if candidate is None:
+            no_match += 1
+            classification = classify_unresolved(edition)
+            db.record_metadata_issue(
+                edition_id=edition["edition_id"],
+                classification=classification,
+                provider=None,
+                reason="No configured metadata provider produced a confident match",
+            )
+            for provider_name, error in provider_errors:
+                db.record_metadata_issue(
+                    edition_id=edition["edition_id"],
+                    classification="PROVIDER_ERROR",
+                    provider=provider_name,
+                    reason=error,
+                )
+            if provider_errors:
+                failed += 1
+                for provider_name, error in provider_errors:
+                    console.print(f"  [red]{provider_name} error:[/red] {error}")
+            console.print(
+                f"  [yellow]No confident metadata match[/yellow] [dim]({classification})[/dim]"
+            )
+            continue
 
         assert lookup_id is not None
         matched += 1
+        db.resolve_metadata_issues(edition_id=edition["edition_id"])
         proposals = build_proposals(edition, candidate)
         db.replace_metadata_proposals(
             edition_id=edition["edition_id"],
@@ -222,7 +251,6 @@ def metadata(
         )
         proposal_count += len(proposals)
 
-        _print_metadata_header(edition)
         console.print(
             f"  {candidate.provider}: confidence={candidate.identity_confidence:.2f}"
             + (" [dim](cached)[/dim]" if used_cache else "")
@@ -244,8 +272,9 @@ def metadata(
 
     console.print()
     console.print(
-        f"Researched {len(rows)} editions: {matched} matched, {no_match} unmatched, "
-        f"{failed} failed; {proposal_count} proposals; {cached_count} cached lookups"
+        f"Researched {len(rows)} editions: {matched} matched, {no_match} unresolved, "
+        f"{failed} with provider errors; {proposal_count} proposals; "
+        f"{cached_count} cached lookups"
     )
     console.print("[dim]No Calibre metadata was modified.[/dim]")
 
@@ -262,6 +291,9 @@ def stats(config: ConfigOpt = None):
             "Metadata lookups": con.execute("SELECT COUNT(*) FROM metadata_lookups").fetchone()[0],
             "Metadata proposals": con.execute(
                 "SELECT COUNT(*) FROM metadata_proposals WHERE status='PROPOSED'"
+            ).fetchone()[0],
+            "Metadata issues": con.execute(
+                "SELECT COUNT(*) FROM metadata_issues WHERE status='OPEN'"
             ).fetchone()[0],
             "Facts": con.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
             "Evidence": con.execute("SELECT COUNT(*) FROM evidence").fetchone()[0],
