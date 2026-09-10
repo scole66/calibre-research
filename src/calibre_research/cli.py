@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Annotated
 
@@ -11,7 +12,6 @@ from rich.table import Table
 from .calibre import CalibreError, scan_library
 from .config import load_config
 from .db import Database
-from collections import Counter
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
@@ -19,34 +19,37 @@ console = Console()
 ConfigOpt = Annotated[Path | None, typer.Option("--config", help="YAML config file")]
 
 
-def _db(config_path: Path | None) -> Database:
-    cfg = load_config(config_path)
-    return Database(cfg.database_path)
+def _db(database_path: Path) -> Database:
+    return Database(database_path)
 
 
 @app.command("init-db")
 def init_db(config: ConfigOpt = None):
-    db = _db(config)
+    cfg = load_config(config)
+    db = _db(cfg.database_path)
     db.initialize()
     console.print(f"Initialized [bold]{db.path}[/bold]")
 
 
 @app.command()
 def scan(
-    library: Annotated[
-        Path,
-        typer.Option("--library", exists=True, file_okay=False),
-    ],
+    library: Annotated[str | None, typer.Option("--library")] = None,
+    executable: Annotated[str | None, typer.Option("--executable")] = None,
     report: Annotated[
-        bool,
-        typer.Option("--report", help="Show metadata completeness summary."),
+        bool, typer.Option("--report", help="Show metadata completeness summary.")
     ] = False,
     config: ConfigOpt = None,
 ):
-    db = _db(config)
+    cfg = load_config(config)
+    library = library or cfg.calibre.library
+    executable = executable or cfg.calibre.executable
+    db = _db(cfg.database_path)
     db.initialize()
     try:
-        books = scan_library(library)
+        books = scan_library(
+            executable=executable,
+            library=library,
+        )
     except CalibreError as exc:
         raise typer.Exit(code=_print_error(str(exc)))
 
@@ -55,7 +58,7 @@ def scan(
     count = 0
 
     for book in books:
-        result = db.upsert_calibre_book(str(library.resolve()), book)
+        result = db.upsert_calibre_book(library, book)
 
         if result.ok:
             count += 1
@@ -114,9 +117,11 @@ def scan(
         console.print(f"  Missing language:    {stats['missing_language']}")
         console.print(f"  With series:         {stats['has_series']}")
 
+
 @app.command()
 def stats(config: ConfigOpt = None):
-    db = _db(config)
+    cfg = load_config(config)
+    db = _db(cfg.database_path)
     db.initialize()
     with db.connect() as con:
         values = {
@@ -126,7 +131,9 @@ def stats(config: ConfigOpt = None):
             "Evidence": con.execute("SELECT COUNT(*) FROM evidence").fetchone()[0],
             "Claims": con.execute("SELECT COUNT(*) FROM significance_claims").fetchone()[0],
             "Scores": con.execute("SELECT COUNT(*) FROM scores").fetchone()[0],
-            "Review queue": con.execute("SELECT COUNT(*) FROM review_queue WHERE status='OPEN'").fetchone()[0],
+            "Review queue": con.execute(
+                "SELECT COUNT(*) FROM review_queue WHERE status='OPEN'"
+            ).fetchone()[0],
         }
     table = Table(title="calibre-research")
     table.add_column("Item")
@@ -173,7 +180,8 @@ def research(
 
 @app.command()
 def review(config: ConfigOpt = None):
-    db = _db(config)
+    cfg = load_config(config)
+    db = _db(cfg.database_path)
     db.initialize()
     with db.connect() as con:
         rows = con.execute(
@@ -190,7 +198,13 @@ def review(config: ConfigOpt = None):
     for col in ["ID", "Title", "Author", "Kind", "Reason"]:
         table.add_column(col)
     for row in rows:
-        table.add_row(str(row["id"]), row["canonical_title"], row["canonical_author"], row["kind"], row["reason"])
+        table.add_row(
+            str(row["id"]),
+            row["canonical_title"],
+            row["canonical_author"],
+            row["kind"],
+            row["reason"],
+        )
     console.print(table)
 
 
@@ -199,7 +213,8 @@ def explain(
     query: str,
     config: ConfigOpt = None,
 ):
-    db = _db(config)
+    cfg = load_config(config)
+    db = _db(cfg.database_path)
     db.initialize()
     with db.connect() as con:
         row = con.execute(

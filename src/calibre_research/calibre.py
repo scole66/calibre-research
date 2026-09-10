@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
-from pathlib import Path
 
 FIELDS = "id,title,authors,isbn,publisher,pubdate,series,series_index,languages"
 
@@ -12,16 +10,12 @@ class CalibreError(RuntimeError):
     pass
 
 
-def scan_library(library: Path) -> list[dict]:
-    exe = shutil.which("calibredb")
-    if not exe:
-        raise CalibreError("calibredb was not found in PATH")
-
+def scan_library(executable: str, library: str) -> list[dict]:
     cmd = [
-        exe,
+        executable,
         "list",
         "--with-library",
-        str(library),
+        library,
         "--fields",
         FIELDS,
         "--for-machine",

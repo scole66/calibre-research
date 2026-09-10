@@ -9,6 +9,7 @@ research:
   reuse_cached_evidence: true
 
 calibre:
-  library: null
+  library: "C:\\Users\\somebody\\Documents\\Calibre Library"
+  executable: "C:\\Program Files\\Calibre2\\calibredb.exe"
   auto_apply_confidence: 0.98
   review_confidence: 0.80

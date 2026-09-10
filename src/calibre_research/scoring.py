@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+
 import yaml
 
 
@@ -8,7 +9,9 @@ def load_rubric(path: Path) -> dict:
     return yaml.safe_load(path.read_text())
 
 
-def score_work(*, rubric: dict, claims_by_category: dict[str, list[dict]]) -> tuple[float, dict[str, float]]:
+def score_work(
+    *, rubric: dict, claims_by_category: dict[str, list[dict]]
+) -> tuple[float, dict[str, float]]:
     """First-pass deterministic scorer.
 
     Only awards have concrete rules in rubric 1.0. Other categories currently
