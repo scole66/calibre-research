@@ -8,8 +8,12 @@ research:
   web_search_enabled: true
   reuse_cached_evidence: true
 
+metadata:
+  provider: openlibrary
+  reuse_cached_lookups: true
+
 calibre:
-  library: "C:\\Users\\somebody\\Documents\\Calibre Library"
-  executable: "C:\\Program Files\\Calibre2\\calibredb.exe"
+  library: null
+  executable: null
   auto_apply_confidence: 0.98
   review_confidence: 0.80
