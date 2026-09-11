@@ -8,7 +8,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from .metadata import MetadataCandidate, MetadataProposal, dump_json
+from .metadata import MetadataCandidate, MetadataProposal, dump_json, metadata_query_key
 
 
 @dataclass(frozen=True)
@@ -37,6 +37,16 @@ class Database:
         con = sqlite3.connect(self.path)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys = ON")
+        con.create_function(
+            "metadata_query_key",
+            3,
+            lambda title, author, isbn: metadata_query_key(
+                title=str(title),
+                author=str(author),
+                isbn=str(isbn) if isbn is not None else None,
+            ),
+            deterministic=True,
+        )
         try:
             yield con
             con.commit()
@@ -109,8 +119,16 @@ class Database:
             return UpsertResult(work_id)
 
     def metadata_candidates(
-        self, *, provider: str, limit: int | None = None
+        self,
+        *,
+        providers: list[str],
+        retry_errors: bool = False,
+        refresh: bool = False,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        if not providers:
+            return []
+        placeholders = ", ".join("?" for _ in providers)
         query = """
             SELECT
                 e.id AS edition_id,
@@ -126,23 +144,79 @@ class Database:
                 e.series_index,
                 e.language
             FROM editions e
+        """
+        params: list[Any] = []
+        if retry_errors:
+            query += f"""
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM metadata_issues mi
+                    WHERE mi.edition_id=e.id
+                      AND mi.classification='PROVIDER_ERROR'
+                      AND mi.status='OPEN'
+                      AND mi.provider IN ({placeholders})
+                )
+            """
+            params.extend(providers)
+        elif not refresh:
+            query += f"""
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM metadata_issues mi
+                    WHERE mi.edition_id=e.id
+                      AND mi.classification='PROVIDER_ERROR'
+                      AND mi.status='OPEN'
+                      AND mi.provider IN ({placeholders})
+                )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM metadata_lookups ml
+                    WHERE ml.edition_id=e.id
+                      AND ml.status='MATCH'
+                      AND ml.provider IN ({placeholders})
+                      AND ml.query_key=metadata_query_key(e.title, e.author, e.isbn)
+                )
+                  AND (
+                    SELECT COUNT(DISTINCT ml.provider)
+                    FROM metadata_lookups ml
+                    WHERE ml.edition_id=e.id
+                      AND ml.status='NO_MATCH'
+                      AND ml.provider IN ({placeholders})
+                      AND ml.query_key=metadata_query_key(e.title, e.author, e.isbn)
+                  ) < ?
+            """
+            params.extend(providers)
+            params.extend(providers)
+            params.extend(providers)
+            params.append(len(providers))
+
+        query += """
             ORDER BY
-                CASE WHEN EXISTS (
-                    SELECT 1 FROM metadata_lookups ml
-                    WHERE ml.edition_id=e.id AND ml.provider=?
-                ) THEN 1 ELSE 0 END,
                 CASE WHEN e.publication_date IS NULL OR e.publication_date = ''
                           OR e.publication_date LIKE '0101-01-01%'
                      THEN 0 ELSE 1 END,
                 CASE WHEN e.isbn IS NULL OR e.isbn = '' THEN 0 ELSE 1 END,
                 e.id
         """
-        params: tuple[Any, ...] = (provider,)
         if limit is not None:
             query += " LIMIT ?"
-            params = (provider, limit)
+            params.append(limit)
         with self.connect() as con:
             return [dict(row) for row in con.execute(query, params).fetchall()]
+
+    def open_metadata_error_providers(self, *, edition_id: int) -> set[str]:
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT provider
+                FROM metadata_issues
+                WHERE edition_id=?
+                  AND classification='PROVIDER_ERROR'
+                  AND status='OPEN'
+                """,
+                (edition_id,),
+            ).fetchall()
+        return {str(row["provider"]) for row in rows}
 
     def cached_metadata_lookup(
         self, *, edition_id: int, provider: str, query_key: str
@@ -292,6 +366,25 @@ class Database:
 
     def resolve_metadata_issues(self, *, edition_id: int) -> None:
         with self.connect() as con:
+            # The schema permits one OPEN and one RESOLVED row for the same issue.
+            # Remove a repeated OPEN occurrence before resolving so transitions such
+            # as error -> unmatched -> error -> match cannot violate that constraint.
+            con.execute(
+                """
+                DELETE FROM metadata_issues AS open_issue
+                WHERE open_issue.edition_id=?
+                  AND open_issue.status='OPEN'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM metadata_issues AS resolved_issue
+                    WHERE resolved_issue.edition_id=open_issue.edition_id
+                      AND resolved_issue.classification=open_issue.classification
+                      AND resolved_issue.provider=open_issue.provider
+                      AND resolved_issue.status='RESOLVED'
+                  )
+                """,
+                (edition_id,),
+            )
             con.execute(
                 """
                 UPDATE metadata_issues

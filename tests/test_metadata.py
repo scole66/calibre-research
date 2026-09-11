@@ -54,7 +54,7 @@ def test_metadata_lookup_and_proposals_are_cached(tmp_path: Path):
     )
     assert result.ok
 
-    edition = db.metadata_candidates(provider="openlibrary", limit=1)[0]
+    edition = db.metadata_candidates(providers=["openlibrary"], limit=1)[0]
     candidate = MetadataCandidate(
         provider="openlibrary",
         query_key="title-author:dreamsnake|vonda n mcintyre",
@@ -316,7 +316,7 @@ def test_metadata_issue_can_be_resolved(tmp_path: Path):
         {"id": "1", "title": "Player Core", "authors": ["Unknown"]},
     )
     assert result.ok
-    edition = db.metadata_candidates(provider="openlibrary", limit=1)[0]
+    edition = db.metadata_candidates(providers=["openlibrary"], limit=1)[0]
 
     db.record_metadata_issue(
         edition_id=edition["edition_id"],
@@ -336,6 +336,113 @@ def test_metadata_issue_can_be_resolved(tmp_path: Path):
             con.execute("SELECT COUNT(*) FROM metadata_issues WHERE status='OPEN'").fetchone()[0]
             == 0
         )
+
+
+def test_metadata_queue_separates_pending_completed_and_provider_errors(tmp_path: Path):
+    db = Database(tmp_path / "test.sqlite3")
+    db.initialize()
+    for book_id, title in enumerate(
+        ["Pending", "Partial", "Unmatched", "Matched", "Provider Error"], start=1
+    ):
+        result = db.upsert_calibre_book(
+            "/library",
+            {"id": str(book_id), "title": title, "authors": ["Test Author"]},
+        )
+        assert result.ok
+
+    editions = {
+        row["title"]: row
+        for row in db.metadata_candidates(providers=["openlibrary", "googlebooks"])
+    }
+    for provider_name in ["openlibrary"]:
+        db.store_metadata_miss(
+            edition_id=editions["Partial"]["edition_id"],
+            provider=provider_name,
+            query_key=metadata_query_key(title="Partial", author="Test Author", isbn=None),
+        )
+    for provider_name in ["openlibrary", "googlebooks"]:
+        db.store_metadata_miss(
+            edition_id=editions["Unmatched"]["edition_id"],
+            provider=provider_name,
+            query_key=metadata_query_key(title="Unmatched", author="Test Author", isbn=None),
+        )
+    db.store_metadata_lookup(
+        edition_id=editions["Matched"]["edition_id"],
+        candidate=MetadataCandidate(
+            provider="openlibrary",
+            query_key=metadata_query_key(title="Matched", author="Test Author", isbn=None),
+            source_url="https://example.invalid/match",
+            identity_confidence=0.95,
+            title="Matched",
+            authors=["Test Author"],
+        ),
+    )
+    db.record_metadata_issue(
+        edition_id=editions["Provider Error"]["edition_id"],
+        classification="PROVIDER_ERROR",
+        provider="googlebooks",
+        reason="temporary failure",
+    )
+
+    pending = db.metadata_candidates(providers=["openlibrary", "googlebooks"])
+    retryable = db.metadata_candidates(providers=["openlibrary", "googlebooks"], retry_errors=True)
+    pending_without_failed_provider = db.metadata_candidates(providers=["openlibrary"])
+    refreshed = db.metadata_candidates(providers=["openlibrary", "googlebooks"], refresh=True)
+
+    assert {row["title"] for row in pending} == {"Pending", "Partial"}
+    assert [row["title"] for row in retryable] == ["Provider Error"]
+    assert "Provider Error" in {row["title"] for row in pending_without_failed_provider}
+    assert {row["title"] for row in refreshed} == {
+        "Pending",
+        "Partial",
+        "Unmatched",
+        "Matched",
+        "Provider Error",
+    }
+    assert db.open_metadata_error_providers(
+        edition_id=editions["Provider Error"]["edition_id"]
+    ) == {"googlebooks"}
+
+    for book_id, title in [(3, "Unmatched Revised"), (4, "Matched Revised")]:
+        result = db.upsert_calibre_book(
+            "/library",
+            {"id": str(book_id), "title": title, "authors": ["Test Author"]},
+        )
+        assert result.ok
+
+    pending_after_rescan = db.metadata_candidates(providers=["openlibrary", "googlebooks"])
+    assert {row["title"] for row in pending_after_rescan} == {
+        "Pending",
+        "Partial",
+        "Unmatched Revised",
+        "Matched Revised",
+    }
+
+
+def test_metadata_issue_can_be_resolved_after_being_reopened(tmp_path: Path):
+    db = Database(tmp_path / "test.sqlite3")
+    db.initialize()
+    result = db.upsert_calibre_book(
+        "/library", {"id": "1", "title": "Dreamsnake", "authors": ["Vonda N. McIntyre"]}
+    )
+    assert result.ok
+    edition = db.metadata_candidates(providers=["openlibrary"])[0]
+
+    for _ in range(2):
+        db.record_metadata_issue(
+            edition_id=edition["edition_id"],
+            classification="PROVIDER_ERROR",
+            provider="openlibrary",
+            reason="temporary failure",
+        )
+        db.resolve_metadata_issues(edition_id=edition["edition_id"])
+
+    with db.connect() as con:
+        rows = con.execute(
+            "SELECT status FROM metadata_issues WHERE edition_id=?",
+            (edition["edition_id"],),
+        ).fetchall()
+    assert [row["status"] for row in rows] == ["RESOLVED"]
 
 
 def test_provider_factory_uses_config_values():
@@ -700,6 +807,140 @@ metadata:
     assert result.exit_code == 0, result.output
     assert calls == ["openlibrary", "googlebooks"]
     assert "googlebooks: confidence=0.95" in result.output
+
+
+def test_metadata_retry_errors_retries_only_failed_provider_and_reclassifies(
+    tmp_path: Path, monkeypatch
+):
+    from typer.testing import CliRunner
+
+    import calibre_research.cli as cli_module
+
+    db = Database(tmp_path / "test.sqlite3")
+    db.initialize()
+    result = db.upsert_calibre_book(
+        "/library",
+        {
+            "id": "1",
+            "title": "A Conventional Boy",
+            "authors": ["Charles Stross"],
+        },
+    )
+    assert result.ok
+    edition = db.metadata_candidates(providers=["openlibrary", "googlebooks"])[0]
+    query_key = metadata_query_key(
+        title=edition["title"], author=edition["author"], isbn=edition["isbn"]
+    )
+    db.store_metadata_miss(
+        edition_id=edition["edition_id"],
+        provider="openlibrary",
+        query_key=query_key,
+    )
+    db.record_metadata_issue(
+        edition_id=edition["edition_id"],
+        classification="PROVIDER_ERROR",
+        provider="googlebooks",
+        reason="temporary failure",
+    )
+    calls = []
+
+    class FakeProvider:
+        def __init__(self, name):
+            self.name = name
+
+        def lookup(self, *, title, author, isbn=None):
+            calls.append(self.name)
+            return None
+
+    monkeypatch.setattr(cli_module, "_db", lambda _path: db)
+    monkeypatch.setattr(
+        cli_module,
+        "make_metadata_provider",
+        lambda name, config: FakeProvider(name),
+    )
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""database: {tmp_path / "ignored.sqlite3"}
+metadata:
+  providers: [openlibrary, googlebooks]
+  reuse_cached_lookups: true
+  openlibrary:
+    base_url: https://openlibrary.org
+    max_books_per_run: 25
+    timeout_seconds: 15
+    max_retries: 2
+    anonymous_requests_per_second: 1
+    identified_requests_per_second: 3
+  googlebooks:
+    base_url: https://www.googleapis.com/books/v1
+    timeout_seconds: 15
+    max_retries: 2
+    requests_per_second: 2
+"""
+    )
+    runner = CliRunner()
+
+    retry_result = runner.invoke(
+        cli_module.app,
+        ["metadata", "--retry-errors", "--config", str(config)],
+    )
+
+    assert retry_result.exit_code == 0, retry_result.output
+    assert calls == ["googlebooks"]
+    assert "No confident metadata match" in retry_result.output
+    with db.connect() as con:
+        open_issues = con.execute(
+            """
+            SELECT classification, provider
+            FROM metadata_issues
+            WHERE edition_id=? AND status='OPEN'
+            """,
+            (edition["edition_id"],),
+        ).fetchall()
+    assert [(row["classification"], row["provider"]) for row in open_issues] == [
+        ("UNMATCHED_GENERIC", "")
+    ]
+
+    second_retry = runner.invoke(
+        cli_module.app,
+        ["metadata", "--retry-errors", "--config", str(config)],
+    )
+    normal_run = runner.invoke(cli_module.app, ["metadata", "--config", str(config)])
+
+    assert second_retry.exit_code == 0
+    assert "No editions with provider errors to retry" in second_retry.output
+    assert normal_run.exit_code == 0
+    assert "No pending editions to research" in normal_run.output
+    assert calls == ["googlebooks"]
+
+
+def test_metadata_retry_errors_rejects_refresh(tmp_path: Path):
+    from typer.testing import CliRunner
+
+    import calibre_research.cli as cli_module
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""database: {tmp_path / "test.sqlite3"}
+metadata:
+  providers: [openlibrary]
+  openlibrary:
+    base_url: https://openlibrary.org
+    max_books_per_run: 25
+    timeout_seconds: 15
+    max_retries: 2
+    anonymous_requests_per_second: 1
+    identified_requests_per_second: 3
+"""
+    )
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["metadata", "--retry-errors", "--refresh", "--config", str(config)],
+    )
+
+    assert result.exit_code == 1
+    assert "--retry-errors cannot be combined with --refresh" in result.output
 
 
 def test_http_provider_retries_retryable_error(monkeypatch):

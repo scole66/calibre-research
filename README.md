@@ -361,6 +361,18 @@ The metadata command performs a non-destructive metadata research pass:
 uv run calibre-research metadata --limit 10
 ```
 
+Ordinary runs select only pending editions. An edition is complete for the configured provider
+chain after a provider matches it or every provider records a confident miss. Provider failures
+remain separate from completed misses and can be retried directly:
+
+```bash
+uv run calibre-research metadata --retry-errors
+```
+
+The retry pass reuses cached matches and misses, calls only providers that previously failed, and
+reconciles the current issue after the provider responds. It cannot be combined with `--refresh`,
+which intentionally includes completed editions and bypasses cached provider evidence.
+
 The initial target workflow is:
 
 ```text

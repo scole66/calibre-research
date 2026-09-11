@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
-from .metadata import MetadataCandidate, normalize_text
+from .metadata import MetadataCandidate, metadata_query_key, normalize_isbn, normalize_text
 from .models import ResearchResult
 
 USER_AGENT_BASE = "calibre-research/0.1 (+https://github.com/scole66/calibre-research)"
@@ -189,7 +189,7 @@ class OpenLibraryProvider(HttpJsonProvider):
         isbn: str | None = None,
     ) -> MetadataCandidate | None:
         query_key = metadata_query_key(title=title, author=author, isbn=isbn)
-        clean_isbn = _clean_isbn(isbn)
+        clean_isbn = normalize_isbn(isbn)
         if clean_isbn:
             candidate = self._lookup_isbn(clean_isbn)
             if candidate is not None:
@@ -311,7 +311,7 @@ class GoogleBooksProvider(HttpJsonProvider):
         if self._unavailable_error is not None:
             raise self._unavailable_error
         query_key = metadata_query_key(title=title, author=author, isbn=isbn)
-        clean_isbn = _clean_isbn(isbn)
+        clean_isbn = normalize_isbn(isbn)
         if clean_isbn:
             candidate = self._search(query=f"isbn:{clean_isbn}", title=title, author=author)
             if candidate is not None:
@@ -381,21 +381,6 @@ def make_provider(name: str) -> ResearchProvider:
     if name == "stub":
         return StubResearchProvider()
     raise ValueError(f"unknown research provider: {name}")
-
-
-def metadata_query_key(*, title: str, author: str, isbn: str | None) -> str:
-    clean_isbn = _clean_isbn(isbn)
-    identity = f"title-author:{normalize_text(title)}|{normalize_text(author)}"
-    if clean_isbn:
-        return f"isbn:{clean_isbn}|{identity}"
-    return identity
-
-
-def _clean_isbn(value: str | None) -> str | None:
-    if not value:
-        return None
-    cleaned = "".join(ch for ch in value if ch.isdigit() or ch in "Xx")
-    return cleaned.upper() or None
 
 
 def _first_text(value: Any) -> str | None:

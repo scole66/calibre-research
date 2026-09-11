@@ -112,6 +112,13 @@ def scan(
 def metadata(
     limit: Annotated[int | None, typer.Option("--limit", min=1)] = None,
     provider: Annotated[str | None, typer.Option("--provider")] = None,
+    retry_errors: Annotated[
+        bool,
+        typer.Option(
+            "--retry-errors",
+            help="Retry editions with an open provider error.",
+        ),
+    ] = False,
     refresh: Annotated[
         bool, typer.Option("--refresh", help="Ignore cached provider lookups.")
     ] = False,
@@ -125,6 +132,8 @@ def metadata(
     provider_names = [provider] if provider else cfg.metadata.providers
     if not provider_names:
         raise typer.Exit(code=_print_error("No metadata providers are configured"))
+    if retry_errors and refresh:
+        raise typer.Exit(code=_print_error("--retry-errors cannot be combined with --refresh"))
 
     providers = []
     for provider_name in provider_names:
@@ -156,9 +165,17 @@ def metadata(
                 )
             )
 
-    rows = db.metadata_candidates(provider=provider_names[0], limit=effective_limit)
+    rows = db.metadata_candidates(
+        providers=provider_names,
+        retry_errors=retry_errors,
+        refresh=refresh,
+        limit=effective_limit,
+    )
     if not rows:
-        console.print("No editions to research.")
+        if retry_errors:
+            console.print("No editions with provider errors to retry.")
+        else:
+            console.print("No pending editions to research.")
         return
 
     matched = 0
@@ -175,6 +192,12 @@ def metadata(
         lookup_id = None
         used_cache = False
         provider_errors: list[tuple[str, str]] = []
+        completed_providers: set[str] = set()
+        error_providers = (
+            db.open_metadata_error_providers(edition_id=edition["edition_id"])
+            if retry_errors
+            else set()
+        )
 
         for metadata_provider in providers:
             provider_name = metadata_provider.name
@@ -188,12 +211,16 @@ def metadata(
 
             if cached is not None:
                 cached_count += 1
+                completed_providers.add(provider_name)
                 if cached["status"] == "NO_MATCH":
                     continue
                 candidate = candidate_from_normalized(cached["normalized"], raw=cached["raw"])
                 lookup_id = cached["id"]
                 used_cache = True
                 break
+
+            if retry_errors and provider_name not in error_providers:
+                continue
 
             try:
                 candidate = metadata_provider.lookup(
@@ -205,6 +232,7 @@ def metadata(
                 provider_errors.append((provider_name, str(exc)))
                 continue
 
+            completed_providers.add(provider_name)
             if candidate is None:
                 db.store_metadata_miss(
                     edition_id=edition["edition_id"],
@@ -223,6 +251,7 @@ def metadata(
         if candidate is None:
             if provider_errors:
                 failed += 1
+                db.resolve_metadata_issues(edition_id=edition["edition_id"])
                 for provider_name, error in provider_errors:
                     db.record_metadata_issue(
                         edition_id=edition["edition_id"],
@@ -235,9 +264,10 @@ def metadata(
                     "  [yellow]Metadata lookup incomplete because a provider failed; "
                     "this edition remains eligible for retry.[/yellow]"
                 )
-            else:
+            elif completed_providers == set(provider_names):
                 no_match += 1
                 classification = classify_unresolved(edition)
+                db.resolve_metadata_issues(edition_id=edition["edition_id"])
                 db.record_metadata_issue(
                     edition_id=edition["edition_id"],
                     classification=classification,
@@ -246,6 +276,12 @@ def metadata(
                 )
                 console.print(
                     f"  [yellow]No confident metadata match[/yellow] [dim]({classification})[/dim]"
+                )
+            else:
+                db.resolve_metadata_issues(edition_id=edition["edition_id"])
+                console.print(
+                    "  [yellow]Provider errors were resolved; remaining providers are "
+                    "pending for a normal metadata run.[/yellow]"
                 )
             continue
 

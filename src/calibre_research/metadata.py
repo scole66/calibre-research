@@ -130,6 +130,21 @@ def normalize_text(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
+def metadata_query_key(*, title: str, author: str, isbn: str | None) -> str:
+    clean_isbn = normalize_isbn(isbn)
+    identity = f"title-author:{normalize_text(title)}|{normalize_text(author)}"
+    if clean_isbn:
+        return f"isbn:{clean_isbn}|{identity}"
+    return identity
+
+
+def normalize_isbn(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = "".join(character for character in value if character.isdigit() or character in "Xx")
+    return cleaned.upper() or None
+
+
 def dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
