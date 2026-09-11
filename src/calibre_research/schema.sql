@@ -138,3 +138,16 @@ CREATE TABLE IF NOT EXISTS metadata_proposals (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(edition_id, field_name, status)
 );
+
+
+CREATE TABLE IF NOT EXISTS metadata_issues (
+    id INTEGER PRIMARY KEY,
+    edition_id INTEGER NOT NULL REFERENCES editions(id) ON DELETE CASCADE,
+    classification TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(edition_id, classification, provider, status)
+);

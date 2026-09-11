@@ -103,7 +103,14 @@ def test_metadata_query_key_is_stable_with_isbn_fallback():
 def test_openlibrary_title_author_search_selects_exact_match(monkeypatch):
     from calibre_research.providers import JsonResponse, OpenLibraryProvider
 
-    provider = OpenLibraryProvider()
+    provider = OpenLibraryProvider(
+        base_url="https://openlibrary.org",
+        timeout=15.0,
+        contact=None,
+        max_retries=2,
+        anonymous_requests_per_second=1.0,
+        identified_requests_per_second=3.0,
+    )
 
     def fake_get_json(url: str):
         return JsonResponse(
@@ -140,8 +147,22 @@ def test_openlibrary_title_author_search_selects_exact_match(monkeypatch):
 def test_openlibrary_identification_controls_request_rate():
     from calibre_research.providers import OpenLibraryProvider
 
-    anonymous = OpenLibraryProvider()
-    identified = OpenLibraryProvider(contact="reader@example.com")
+    anonymous = OpenLibraryProvider(
+        base_url="https://openlibrary.org",
+        timeout=15.0,
+        contact=None,
+        max_retries=2,
+        anonymous_requests_per_second=1.0,
+        identified_requests_per_second=3.0,
+    )
+    identified = OpenLibraryProvider(
+        base_url="https://openlibrary.org",
+        timeout=15.0,
+        contact="reader@example.com",
+        max_retries=2,
+        anonymous_requests_per_second=1.0,
+        identified_requests_per_second=3.0,
+    )
 
     assert anonymous.requests_per_second == 1.0
     assert identified.requests_per_second == 3.0
@@ -152,7 +173,14 @@ def test_openlibrary_rate_limiter_sleeps(monkeypatch):
     import calibre_research.providers as providers_module
     from calibre_research.providers import OpenLibraryProvider
 
-    provider = OpenLibraryProvider()
+    provider = OpenLibraryProvider(
+        base_url="https://openlibrary.org",
+        timeout=15.0,
+        contact=None,
+        max_retries=2,
+        anonymous_requests_per_second=1.0,
+        identified_requests_per_second=3.0,
+    )
     provider._last_request_at = 10.0
 
     sleeps = []
@@ -167,7 +195,14 @@ def test_openlibrary_rate_limiter_sleeps(monkeypatch):
 def test_openlibrary_isbn_uses_single_search_request(monkeypatch):
     from calibre_research.providers import JsonResponse, OpenLibraryProvider
 
-    provider = OpenLibraryProvider()
+    provider = OpenLibraryProvider(
+        base_url="https://openlibrary.org",
+        timeout=15.0,
+        contact=None,
+        max_retries=2,
+        anonymous_requests_per_second=1.0,
+        identified_requests_per_second=3.0,
+    )
     urls = []
 
     def fake_get_json(url: str):
@@ -201,3 +236,520 @@ def test_openlibrary_isbn_uses_single_search_request(monkeypatch):
     assert len(urls) == 1
     assert "search.json" in urls[0]
     assert "isbn=9781234567890" in urls[0]
+
+
+def test_classify_unresolved_unknown_author():
+    from calibre_research.metadata import classify_unresolved
+
+    assert (
+        classify_unresolved({"title": "Player Core", "author": "Unknown"})
+        == "MISSING_OR_SUSPICIOUS_AUTHOR"
+    )
+
+
+def test_classify_unresolved_generic():
+    from calibre_research.metadata import classify_unresolved
+
+    assert (
+        classify_unresolved({"title": "A Conventional Boy", "author": "Charles Stross"})
+        == "UNMATCHED_GENERIC"
+    )
+
+
+def test_googlebooks_selects_exact_match(monkeypatch):
+    from calibre_research.providers import GoogleBooksProvider, JsonResponse
+
+    provider = GoogleBooksProvider(
+        base_url="https://example.invalid/books/v1",
+        timeout=1.0,
+        api_key=None,
+        max_retries=0,
+        requests_per_second=0,
+    )
+
+    def fake_get_json(url: str):
+        return JsonResponse(
+            url=url,
+            data={
+                "items": [
+                    {
+                        "volumeInfo": {
+                            "title": "Dreamsnake Study Guide",
+                            "authors": ["Someone Else"],
+                            "publishedDate": "2020",
+                        }
+                    },
+                    {
+                        "volumeInfo": {
+                            "title": "Dreamsnake",
+                            "authors": ["Vonda N. McIntyre"],
+                            "publisher": "Houghton Mifflin",
+                            "publishedDate": "1978-03-29",
+                            "language": "en",
+                            "industryIdentifiers": [
+                                {"type": "ISBN_13", "identifier": "9781234567890"}
+                            ],
+                        }
+                    },
+                ]
+            },
+        )
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+    candidate = provider.lookup(title="Dreamsnake", author="Vonda N. McIntyre")
+
+    assert candidate is not None
+    assert candidate.provider == "googlebooks"
+    assert candidate.title == "Dreamsnake"
+    assert candidate.publisher == "Houghton Mifflin"
+    assert candidate.isbn == "9781234567890"
+    assert candidate.original_publication_date is None
+    assert candidate.edition_publication_date == "1978-03-29"
+    assert candidate.identity_confidence == 0.95
+
+
+def test_metadata_issue_can_be_resolved(tmp_path: Path):
+    db = Database(tmp_path / "test.sqlite3")
+    db.initialize()
+    result = db.upsert_calibre_book(
+        "/library",
+        {"id": "1", "title": "Player Core", "authors": ["Unknown"]},
+    )
+    assert result.ok
+    edition = db.metadata_candidates(provider="openlibrary", limit=1)[0]
+
+    db.record_metadata_issue(
+        edition_id=edition["edition_id"],
+        classification="MISSING_OR_SUSPICIOUS_AUTHOR",
+        provider=None,
+        reason="No configured provider produced a confident match",
+    )
+    with db.connect() as con:
+        assert (
+            con.execute("SELECT COUNT(*) FROM metadata_issues WHERE status='OPEN'").fetchone()[0]
+            == 1
+        )
+
+    db.resolve_metadata_issues(edition_id=edition["edition_id"])
+    with db.connect() as con:
+        assert (
+            con.execute("SELECT COUNT(*) FROM metadata_issues WHERE status='OPEN'").fetchone()[0]
+            == 0
+        )
+
+
+def test_provider_factory_uses_config_values():
+    from calibre_research.providers import GoogleBooksProvider, make_metadata_provider
+
+    provider = make_metadata_provider(
+        "googlebooks",
+        {
+            "base_url": "https://example.invalid/books/v1",
+            "api_key": "secret",
+            "timeout_seconds": 7.0,
+            "max_retries": 4,
+            "retry_wait_multiplier_seconds": 0.75,
+            "retry_wait_max_seconds": 20.0,
+            "requests_per_second": 1.5,
+        },
+    )
+
+    assert isinstance(provider, GoogleBooksProvider)
+    assert provider.base_url == "https://example.invalid/books/v1"
+    assert provider.api_key == "secret"
+    assert provider.timeout == 7.0
+    assert provider.max_retries == 4
+    assert provider.retry_wait_multiplier_seconds == 0.75
+    assert provider.retry_wait_max_seconds == 20.0
+    assert provider.requests_per_second == 1.5
+
+
+def test_googlebooks_api_key_command_takes_precedence(monkeypatch):
+    import subprocess
+
+    from calibre_research.providers import GoogleBooksProvider, make_metadata_provider
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout=" command-secret\n", stderr="")
+
+    monkeypatch.setattr("calibre_research.providers.subprocess.run", fake_run)
+    provider = make_metadata_provider(
+        "googlebooks",
+        {
+            "base_url": "https://example.invalid/books/v1",
+            "api_key": "literal-secret",
+            "api_key_command": ["op", "read", "op://vault/item/field"],
+            "api_key_command_timeout_seconds": 9.0,
+            "timeout_seconds": 7.0,
+            "max_retries": 4,
+            "retry_wait_multiplier_seconds": 0.5,
+            "retry_wait_max_seconds": 12.0,
+            "requests_per_second": 1.5,
+        },
+    )
+
+    assert isinstance(provider, GoogleBooksProvider)
+    assert provider.api_key == "command-secret"
+    assert calls == [
+        (
+            ["op", "read", "op://vault/item/field"],
+            {
+                "check": False,
+                "capture_output": True,
+                "text": True,
+                "timeout": 9.0,
+            },
+        )
+    ]
+    assert provider.retry_wait_multiplier_seconds == 0.5
+    assert provider.retry_wait_max_seconds == 12.0
+
+
+def test_googlebooks_api_key_command_has_no_default_timeout(tmp_path, monkeypatch):
+    import subprocess
+
+    from calibre_research.config import load_config
+    from calibre_research.providers import make_metadata_provider
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="secret\n", stderr="")
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """metadata:
+  googlebooks:
+    base_url: https://example.invalid/books/v1
+    api_key_command: [op, read, op://vault/item/field]
+    timeout_seconds: 7
+    max_retries: 1
+    requests_per_second: 1
+"""
+    )
+    config = load_config(config_path)
+    monkeypatch.setattr("calibre_research.providers.subprocess.run", fake_run)
+
+    assert config.metadata.googlebooks is not None
+    make_metadata_provider("googlebooks", config.metadata.googlebooks.model_dump())
+
+    assert calls[0]["timeout"] is None
+
+
+def test_googlebooks_requires_credentials_when_enabled():
+    import pytest
+
+    from calibre_research.providers import ProviderConfigurationError, make_metadata_provider
+
+    with pytest.raises(ProviderConfigurationError, match="no credentials"):
+        make_metadata_provider(
+            "googlebooks",
+            {
+                "base_url": "https://example.invalid/books/v1",
+                "api_key": None,
+                "api_key_command": None,
+                "api_key_command_timeout_seconds": 15.0,
+                "timeout_seconds": 7.0,
+                "max_retries": 1,
+                "retry_wait_multiplier_seconds": 1.0,
+                "retry_wait_max_seconds": 30.0,
+                "requests_per_second": 1.5,
+            },
+        )
+
+
+def test_metadata_command_reports_missing_googlebooks_credentials(tmp_path):
+    from typer.testing import CliRunner
+
+    import calibre_research.cli as cli_module
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""database: {tmp_path / "test.sqlite3"}
+metadata:
+  providers: [googlebooks]
+  googlebooks:
+    base_url: https://www.googleapis.com/books/v1
+    timeout_seconds: 15
+    max_retries: 2
+    requests_per_second: 2
+"""
+    )
+
+    result = CliRunner().invoke(cli_module.app, ["metadata", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert "googlebooks is enabled but no credentials are configured" in result.output
+
+
+def test_googlebooks_rejects_empty_api_key_command():
+    import pytest
+
+    from calibre_research.providers import ProviderConfigurationError, resolve_api_key
+
+    with pytest.raises(ProviderConfigurationError, match="non-empty list"):
+        resolve_api_key({"api_key_command": []})
+
+
+def test_googlebooks_key_command_failure_surfaces_stderr_but_not_stdout(monkeypatch):
+    import subprocess
+
+    import pytest
+
+    from calibre_research.providers import ProviderConfigurationError, resolve_api_key
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command, 1, stdout="secret-from-stdout", stderr="secret-from-stderr"
+        )
+
+    monkeypatch.setattr("calibre_research.providers.subprocess.run", fake_run)
+    with pytest.raises(ProviderConfigurationError) as caught:
+        resolve_api_key(
+            {
+                "api_key_command": ["op", "read", "op://vault/item/field"],
+                "api_key_command_timeout_seconds": 15.0,
+            }
+        )
+
+    message = str(caught.value)
+    assert "secret-from-stdout" not in message
+    assert message.endswith(": secret-from-stderr")
+
+
+def test_googlebooks_redacts_api_key_from_source_url(monkeypatch):
+    from calibre_research.providers import GoogleBooksProvider, JsonResponse
+
+    provider = GoogleBooksProvider(
+        base_url="https://example.invalid/books/v1",
+        timeout=1.0,
+        api_key="top-secret",
+        max_retries=0,
+        requests_per_second=0,
+    )
+
+    def fake_get_json(url: str):
+        return JsonResponse(
+            url=url,
+            data={
+                "items": [
+                    {
+                        "volumeInfo": {
+                            "title": "Dreamsnake",
+                            "authors": ["Vonda N. McIntyre"],
+                            "publishedDate": "1978",
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+    candidate = provider.lookup(title="Dreamsnake", author="Vonda N. McIntyre")
+
+    assert candidate is not None
+    assert "top-secret" not in candidate.source_url
+    assert "key=" not in candidate.source_url
+
+
+def test_googlebooks_zero_daily_quota_disables_provider_without_retry(monkeypatch):
+    import io
+    from urllib.error import HTTPError
+
+    import pytest
+
+    from calibre_research.providers import GoogleBooksProvider, ProviderUnavailableError
+
+    provider = GoogleBooksProvider(
+        base_url="https://example.invalid/books/v1",
+        timeout=1.0,
+        api_key="top-secret",
+        max_retries=3,
+        requests_per_second=0,
+    )
+    body = b"""{
+      "error": {
+        "code": 429,
+        "message": "Quota exceeded for quota metric 'Queries' and limit 'Queries per day'",
+        "details": [{"metadata": {"quota_limit_value": "0"}}]
+      }
+    }"""
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        calls.append(request.full_url)
+        raise HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(body))
+
+    monkeypatch.setattr("calibre_research.providers.urlopen", fake_urlopen)
+
+    with pytest.raises(ProviderUnavailableError, match="disabled for the remainder"):
+        provider.lookup(title="Dreamsnake", author="Vonda N. McIntyre")
+    with pytest.raises(ProviderUnavailableError, match="disabled for the remainder"):
+        provider.lookup(title="Another Book", author="Another Author")
+
+    assert len(calls) == 1
+
+
+def test_googlebooks_ordinary_429_remains_retryable():
+    from calibre_research.providers import GoogleBooksProvider, RetryableProviderError
+
+    provider = GoogleBooksProvider(
+        base_url="https://example.invalid/books/v1",
+        timeout=1.0,
+        api_key="top-secret",
+        max_retries=1,
+        requests_per_second=0,
+    )
+
+    error = provider._http_error(
+        429,
+        "https://example.invalid/books/v1/volumes?key=top-secret",
+        '{"error":{"message":"key top-secret","errors":[{"reason":"rateLimitExceeded"}]}}',
+    )
+
+    assert isinstance(error, RetryableProviderError)
+    assert "top-secret" not in str(error)
+
+
+def test_metadata_command_falls_back_in_configured_order(tmp_path: Path, monkeypatch):
+    from typer.testing import CliRunner
+
+    import calibre_research.cli as cli_module
+    from calibre_research.metadata import MetadataCandidate
+
+    db = Database(tmp_path / "test.sqlite3")
+    db.initialize()
+    db.upsert_calibre_book(
+        "/library",
+        {
+            "id": "1",
+            "title": "A Conventional Boy",
+            "authors": ["Charles Stross"],
+            "pubdate": "0101-01-01T00:00:00+00:00",
+        },
+    )
+
+    calls = []
+
+    class FakeProvider:
+        def __init__(self, name):
+            self.name = name
+
+        def lookup(self, *, title, author, isbn=None):
+            calls.append(self.name)
+            if self.name == "openlibrary":
+                return None
+            return MetadataCandidate(
+                provider="googlebooks",
+                query_key="ignored",
+                source_url="https://example.invalid/result",
+                identity_confidence=0.95,
+                title=title,
+                authors=[author],
+                edition_publication_date="2024",
+            )
+
+    monkeypatch.setattr(cli_module, "_db", lambda _path: db)
+    monkeypatch.setattr(
+        cli_module,
+        "make_metadata_provider",
+        lambda name, config: FakeProvider(name),
+    )
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""database: {tmp_path / "ignored.sqlite3"}
+metadata:
+  providers:
+    - openlibrary
+    - googlebooks
+  reuse_cached_lookups: true
+  openlibrary:
+    base_url: https://openlibrary.org
+    contact: null
+    max_books_per_run: 25
+    timeout_seconds: 15
+    max_retries: 2
+    anonymous_requests_per_second: 1
+    identified_requests_per_second: 3
+  googlebooks:
+    base_url: https://www.googleapis.com/books/v1
+    api_key: null
+    timeout_seconds: 15
+    max_retries: 2
+    requests_per_second: 2
+"""
+    )
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["metadata", "--limit", "1", "--config", str(config)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["openlibrary", "googlebooks"]
+    assert "googlebooks: confidence=0.95" in result.output
+
+
+def test_http_provider_retries_retryable_error(monkeypatch):
+    from calibre_research.providers import OpenLibraryProvider, RetryableProviderError
+
+    provider = OpenLibraryProvider(
+        base_url="https://openlibrary.org",
+        timeout=15.0,
+        contact=None,
+        max_retries=2,
+        anonymous_requests_per_second=1.0,
+        identified_requests_per_second=3.0,
+    )
+    calls = []
+
+    def fake_once(url: str):
+        calls.append(url)
+        if len(calls) < 3:
+            raise RetryableProviderError("temporary")
+        return None
+
+    monkeypatch.setattr(provider, "_get_json_once", fake_once)
+    # Remove Tenacity wait time from the unit test while leaving production
+    # exponential+jitter behavior intact.
+    monkeypatch.setattr(
+        "calibre_research.providers.wait_random_exponential", lambda **kwargs: lambda retry_state: 0
+    )
+
+    # _get_json constructs its Retrying object at call time.
+    assert provider._get_json("https://example.invalid") is None
+    assert len(calls) == 3
+
+
+def test_http_provider_stops_after_configured_retries(monkeypatch):
+    from calibre_research.providers import OpenLibraryProvider, RetryableProviderError
+
+    provider = OpenLibraryProvider(
+        base_url="https://openlibrary.org",
+        timeout=15.0,
+        contact=None,
+        max_retries=1,
+        anonymous_requests_per_second=1.0,
+        identified_requests_per_second=3.0,
+    )
+    calls = []
+
+    def fake_once(url: str):
+        calls.append(url)
+        raise RetryableProviderError("temporary")
+
+    monkeypatch.setattr(provider, "_get_json_once", fake_once)
+    monkeypatch.setattr(
+        "calibre_research.providers.wait_random_exponential", lambda **kwargs: lambda retry_state: 0
+    )
+
+    import pytest
+
+    with pytest.raises(RetryableProviderError):
+        provider._get_json("https://example.invalid")
+    assert len(calls) == 2
