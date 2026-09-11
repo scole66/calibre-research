@@ -558,6 +558,7 @@ def test_googlebooks_redacts_api_key_from_source_url(monkeypatch):
 
 def test_googlebooks_zero_daily_quota_disables_provider_without_retry(monkeypatch):
     import io
+    from email.message import Message
     from urllib.error import HTTPError
 
     import pytest
@@ -582,7 +583,13 @@ def test_googlebooks_zero_daily_quota_disables_provider_without_retry(monkeypatc
 
     def fake_urlopen(request, timeout):
         calls.append(request.full_url)
-        raise HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(body))
+        raise HTTPError(
+            request.full_url,
+            429,
+            "Too Many Requests",
+            Message(),
+            io.BytesIO(body),
+        )
 
     monkeypatch.setattr("calibre_research.providers.urlopen", fake_urlopen)
 
