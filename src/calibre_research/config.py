@@ -21,6 +21,8 @@ class OpenLibraryConfig(BaseModel):
     max_books_per_run: int
     timeout_seconds: float
     max_retries: int
+    retry_wait_multiplier_seconds: float = 1.0
+    retry_wait_max_seconds: float = 30.0
     anonymous_requests_per_second: float
     identified_requests_per_second: float
 
@@ -28,8 +30,12 @@ class OpenLibraryConfig(BaseModel):
 class GoogleBooksConfig(BaseModel):
     base_url: str
     api_key: str | None = None
+    api_key_command: list[str] | None = None
+    api_key_command_timeout_seconds: float | None = None
     timeout_seconds: float
     max_retries: int
+    retry_wait_multiplier_seconds: float = 1.0
+    retry_wait_max_seconds: float = 30.0
     requests_per_second: float
 
 

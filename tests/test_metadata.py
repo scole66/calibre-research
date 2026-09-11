@@ -348,6 +348,8 @@ def test_provider_factory_uses_config_values():
             "api_key": "secret",
             "timeout_seconds": 7.0,
             "max_retries": 4,
+            "retry_wait_multiplier_seconds": 0.75,
+            "retry_wait_max_seconds": 20.0,
             "requests_per_second": 1.5,
         },
     )
@@ -357,7 +359,166 @@ def test_provider_factory_uses_config_values():
     assert provider.api_key == "secret"
     assert provider.timeout == 7.0
     assert provider.max_retries == 4
+    assert provider.retry_wait_multiplier_seconds == 0.75
+    assert provider.retry_wait_max_seconds == 20.0
     assert provider.requests_per_second == 1.5
+
+
+def test_googlebooks_api_key_command_takes_precedence(monkeypatch):
+    import subprocess
+
+    from calibre_research.providers import GoogleBooksProvider, make_metadata_provider
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout=" command-secret\n", stderr="")
+
+    monkeypatch.setattr("calibre_research.providers.subprocess.run", fake_run)
+    provider = make_metadata_provider(
+        "googlebooks",
+        {
+            "base_url": "https://example.invalid/books/v1",
+            "api_key": "literal-secret",
+            "api_key_command": ["op", "read", "op://vault/item/field"],
+            "api_key_command_timeout_seconds": 9.0,
+            "timeout_seconds": 7.0,
+            "max_retries": 4,
+            "retry_wait_multiplier_seconds": 0.5,
+            "retry_wait_max_seconds": 12.0,
+            "requests_per_second": 1.5,
+        },
+    )
+
+    assert isinstance(provider, GoogleBooksProvider)
+    assert provider.api_key == "command-secret"
+    assert calls == [
+        (
+            ["op", "read", "op://vault/item/field"],
+            {
+                "check": False,
+                "capture_output": True,
+                "text": True,
+                "timeout": 9.0,
+            },
+        )
+    ]
+    assert provider.retry_wait_multiplier_seconds == 0.5
+    assert provider.retry_wait_max_seconds == 12.0
+
+
+def test_googlebooks_api_key_command_has_no_default_timeout(tmp_path, monkeypatch):
+    import subprocess
+
+    from calibre_research.config import load_config
+    from calibre_research.providers import make_metadata_provider
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="secret\n", stderr="")
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """metadata:
+  googlebooks:
+    base_url: https://example.invalid/books/v1
+    api_key_command: [op, read, op://vault/item/field]
+    timeout_seconds: 7
+    max_retries: 1
+    requests_per_second: 1
+"""
+    )
+    config = load_config(config_path)
+    monkeypatch.setattr("calibre_research.providers.subprocess.run", fake_run)
+
+    assert config.metadata.googlebooks is not None
+    make_metadata_provider("googlebooks", config.metadata.googlebooks.model_dump())
+
+    assert calls[0]["timeout"] is None
+
+
+def test_googlebooks_requires_credentials_when_enabled():
+    import pytest
+
+    from calibre_research.providers import ProviderConfigurationError, make_metadata_provider
+
+    with pytest.raises(ProviderConfigurationError, match="no credentials"):
+        make_metadata_provider(
+            "googlebooks",
+            {
+                "base_url": "https://example.invalid/books/v1",
+                "api_key": None,
+                "api_key_command": None,
+                "api_key_command_timeout_seconds": 15.0,
+                "timeout_seconds": 7.0,
+                "max_retries": 1,
+                "retry_wait_multiplier_seconds": 1.0,
+                "retry_wait_max_seconds": 30.0,
+                "requests_per_second": 1.5,
+            },
+        )
+
+
+def test_metadata_command_reports_missing_googlebooks_credentials(tmp_path):
+    from typer.testing import CliRunner
+
+    import calibre_research.cli as cli_module
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""database: {tmp_path / "test.sqlite3"}
+metadata:
+  providers: [googlebooks]
+  googlebooks:
+    base_url: https://www.googleapis.com/books/v1
+    timeout_seconds: 15
+    max_retries: 2
+    requests_per_second: 2
+"""
+    )
+
+    result = CliRunner().invoke(cli_module.app, ["metadata", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert "googlebooks is enabled but no credentials are configured" in result.output
+
+
+def test_googlebooks_rejects_empty_api_key_command():
+    import pytest
+
+    from calibre_research.providers import ProviderConfigurationError, resolve_api_key
+
+    with pytest.raises(ProviderConfigurationError, match="non-empty list"):
+        resolve_api_key({"api_key_command": []})
+
+
+def test_googlebooks_key_command_failure_surfaces_stderr_but_not_stdout(monkeypatch):
+    import subprocess
+
+    import pytest
+
+    from calibre_research.providers import ProviderConfigurationError, resolve_api_key
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command, 1, stdout="secret-from-stdout", stderr="secret-from-stderr"
+        )
+
+    monkeypatch.setattr("calibre_research.providers.subprocess.run", fake_run)
+    with pytest.raises(ProviderConfigurationError) as caught:
+        resolve_api_key(
+            {
+                "api_key_command": ["op", "read", "op://vault/item/field"],
+                "api_key_command_timeout_seconds": 15.0,
+            }
+        )
+
+    message = str(caught.value)
+    assert "secret-from-stdout" not in message
+    assert message.endswith(": secret-from-stderr")
 
 
 def test_googlebooks_redacts_api_key_from_source_url(monkeypatch):
@@ -393,6 +554,65 @@ def test_googlebooks_redacts_api_key_from_source_url(monkeypatch):
     assert candidate is not None
     assert "top-secret" not in candidate.source_url
     assert "key=" not in candidate.source_url
+
+
+def test_googlebooks_zero_daily_quota_disables_provider_without_retry(monkeypatch):
+    import io
+    from urllib.error import HTTPError
+
+    import pytest
+
+    from calibre_research.providers import GoogleBooksProvider, ProviderUnavailableError
+
+    provider = GoogleBooksProvider(
+        base_url="https://example.invalid/books/v1",
+        timeout=1.0,
+        api_key="top-secret",
+        max_retries=3,
+        requests_per_second=0,
+    )
+    body = b"""{
+      "error": {
+        "code": 429,
+        "message": "Quota exceeded for quota metric 'Queries' and limit 'Queries per day'",
+        "details": [{"metadata": {"quota_limit_value": "0"}}]
+      }
+    }"""
+    calls = []
+
+    def fake_urlopen(request, timeout):
+        calls.append(request.full_url)
+        raise HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(body))
+
+    monkeypatch.setattr("calibre_research.providers.urlopen", fake_urlopen)
+
+    with pytest.raises(ProviderUnavailableError, match="disabled for the remainder"):
+        provider.lookup(title="Dreamsnake", author="Vonda N. McIntyre")
+    with pytest.raises(ProviderUnavailableError, match="disabled for the remainder"):
+        provider.lookup(title="Another Book", author="Another Author")
+
+    assert len(calls) == 1
+
+
+def test_googlebooks_ordinary_429_remains_retryable():
+    from calibre_research.providers import GoogleBooksProvider, RetryableProviderError
+
+    provider = GoogleBooksProvider(
+        base_url="https://example.invalid/books/v1",
+        timeout=1.0,
+        api_key="top-secret",
+        max_retries=1,
+        requests_per_second=0,
+    )
+
+    error = provider._http_error(
+        429,
+        "https://example.invalid/books/v1/volumes?key=top-secret",
+        '{"error":{"message":"key top-secret","errors":[{"reason":"rateLimitExceeded"}]}}',
+    )
+
+    assert isinstance(error, RetryableProviderError)
+    assert "top-secret" not in str(error)
 
 
 def test_metadata_command_falls_back_in_configured_order(tmp_path: Path, monkeypatch):
@@ -442,7 +662,27 @@ def test_metadata_command_falls_back_in_configured_order(tmp_path: Path, monkeyp
 
     config = tmp_path / "config.yaml"
     config.write_text(
-        f"""database: {tmp_path / "ignored.sqlite3"}\nmetadata:\n  providers:\n    - openlibrary\n    - googlebooks\n  reuse_cached_lookups: true\n  openlibrary:\n    base_url: https://openlibrary.org\n    contact: null\n    max_books_per_run: 25\n    timeout_seconds: 15\n    max_retries: 2\n    anonymous_requests_per_second: 1\n    identified_requests_per_second: 3\n  googlebooks:\n    base_url: https://www.googleapis.com/books/v1\n    api_key: null\n    timeout_seconds: 15\n    max_retries: 2\n    requests_per_second: 2\n"""
+        f"""database: {tmp_path / "ignored.sqlite3"}
+metadata:
+  providers:
+    - openlibrary
+    - googlebooks
+  reuse_cached_lookups: true
+  openlibrary:
+    base_url: https://openlibrary.org
+    contact: null
+    max_books_per_run: 25
+    timeout_seconds: 15
+    max_retries: 2
+    anonymous_requests_per_second: 1
+    identified_requests_per_second: 3
+  googlebooks:
+    base_url: https://www.googleapis.com/books/v1
+    api_key: null
+    timeout_seconds: 15
+    max_retries: 2
+    requests_per_second: 2
+"""
     )
 
     result = CliRunner().invoke(

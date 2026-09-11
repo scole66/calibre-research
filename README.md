@@ -20,6 +20,12 @@ Currently implemented:
 * separation of works and editions
 * metadata completeness reporting
 * configuration via `config.yaml`
+* ordered Open Library and Google Books metadata providers
+* persistent positive and negative provider-result caching
+* non-destructive metadata repair proposals
+* metadata issue tracking with provider-error semantics
+* bounded retry and request-pacing controls
+* command-based Google Books API-key resolution
 * versioned scoring-rubric infrastructure
 * initial CLI commands
 * tests
@@ -27,9 +33,6 @@ Currently implemented:
 
 Planned:
 
-* structured metadata lookup
-* metadata repair proposals
-* persistent evidence caching
 * LLM-assisted significance research
 * awards and historical-significance research
 * confidence scoring and review queues
@@ -98,8 +101,8 @@ For example:
 database: "~/.local/share/calibre-research/research.sqlite"
 
 research:
-  max_cost_per_run: 5.00
-  max_cost_per_book: 0.10
+  max_cost_per_run_usd: 5.00
+  max_cost_per_book_usd: 0.10
   reuse_cached_evidence: true
 
 calibre:
@@ -352,7 +355,11 @@ Changing rubric version 1.0 to 1.1 should require rescoring, not researching the
 
 ## Metadata research
 
-The next major implementation milestone is a non-destructive metadata research pass.
+The metadata command performs a non-destructive metadata research pass:
+
+```bash
+uv run calibre-research metadata --limit 10
+```
 
 The initial target workflow is:
 
@@ -390,6 +397,38 @@ Initial metadata fields of interest include:
 Research should initially produce **proposals only**.
 
 Writing changes back to Calibre will be a separate, explicit operation.
+
+Metadata providers are configured and tried in order. Google Books requires an API key when it
+is enabled. Prefer resolving it through an external secret manager instead of storing it in YAML:
+
+```yaml
+metadata:
+  # Listing a provider enables it. Providers are tried in this order.
+  providers:
+    - openlibrary
+    - googlebooks
+
+  googlebooks:
+    base_url: https://www.googleapis.com/books/v1
+    api_key_command:
+      - op
+      - read
+      - "op://your-vault/calibre-research/google-books-api-key"
+    # Wait indefinitely for interactive authentication by default.
+    api_key_command_timeout_seconds: null
+    timeout_seconds: 15.0
+    max_retries: 2
+    retry_wait_multiplier_seconds: 1.0
+    retry_wait_max_seconds: 30.0
+    requests_per_second: 2.0
+```
+
+`api_key_command` is executed directly without a shell. Its trimmed standard output is used as
+the key and takes precedence over the literal `api_key` fallback. Resolved keys are excluded from
+stored source URLs and provider error messages. A null `api_key_command_timeout_seconds` waits
+until the command finishes or the user interrupts it; set a finite number of seconds for
+unattended runs if desired. If the command fails, its standard error is included in the CLI
+diagnostic while standard output is discarded.
 
 ## Significance research
 

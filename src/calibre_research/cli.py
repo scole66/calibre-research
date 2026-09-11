@@ -135,7 +135,7 @@ def metadata(
                     f"metadata provider {provider_name!r} has no configuration section"
                 )
             providers.append(make_metadata_provider(provider_name, provider_settings.model_dump()))
-        except (AttributeError, ValueError) as exc:
+        except (AttributeError, ProviderError, ValueError) as exc:
             raise typer.Exit(code=_print_error(str(exc))) from exc
 
     effective_limit = limit

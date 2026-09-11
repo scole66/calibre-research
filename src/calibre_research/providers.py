@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
@@ -23,6 +24,14 @@ class ProviderError(RuntimeError):
 
 class RetryableProviderError(ProviderError):
     pass
+
+
+class ProviderConfigurationError(ProviderError):
+    pass
+
+
+class ProviderUnavailableError(ProviderError):
+    """The provider cannot service more requests during this invocation."""
 
 
 class ResearchProvider(ABC):
@@ -71,11 +80,15 @@ class HttpJsonProvider(MetadataProvider):
         timeout: float,
         max_retries: int,
         requests_per_second: float,
+        retry_wait_multiplier_seconds: float = 1.0,
+        retry_wait_max_seconds: float = 30.0,
         user_agent: str = USER_AGENT_BASE,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
+        self.retry_wait_multiplier_seconds = retry_wait_multiplier_seconds
+        self.retry_wait_max_seconds = retry_wait_max_seconds
         self.requests_per_second = requests_per_second
         self.user_agent = user_agent
         self._last_request_at: float | None = None
@@ -94,7 +107,10 @@ class HttpJsonProvider(MetadataProvider):
     def _get_json(self, url: str) -> JsonResponse | None:
         retrying = Retrying(
             stop=stop_after_attempt(self.max_retries + 1),
-            wait=wait_random_exponential(multiplier=1.0, max=30.0),
+            wait=wait_random_exponential(
+                multiplier=self.retry_wait_multiplier_seconds,
+                max=self.retry_wait_max_seconds,
+            ),
             retry=retry_if_exception_type(RetryableProviderError),
             reraise=True,
         )
@@ -113,14 +129,24 @@ class HttpJsonProvider(MetadataProvider):
         except HTTPError as exc:
             if exc.code == 404:
                 return None
-            message = f"{self.name} returned HTTP {exc.code} for {self._safe_url(url)}"
-            if exc.code == 429 or 500 <= exc.code < 600:
-                raise RetryableProviderError(message) from exc
-            raise ProviderError(message) from exc
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = None
+            error = self._http_error(exc.code, url, body)
+            raise error from exc
         except (URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise RetryableProviderError(
                 f"{self.name} request failed for {self._safe_url(url)}: {exc}"
             ) from exc
+
+    def _http_error(self, status: int, url: str, body: str | None) -> ProviderError:
+        message = f"{self.name} returned HTTP {status} for {self._safe_url(url)}" + (
+            f": {body}" if body else ""
+        )
+        if status == 429 or 500 <= status < 600:
+            return RetryableProviderError(message)
+        return ProviderError(message)
 
 
 class OpenLibraryProvider(HttpJsonProvider):
@@ -135,6 +161,8 @@ class OpenLibraryProvider(HttpJsonProvider):
         max_retries: int,
         anonymous_requests_per_second: float,
         identified_requests_per_second: float,
+        retry_wait_multiplier_seconds: float = 1.0,
+        retry_wait_max_seconds: float = 30.0,
     ):
         user_agent = USER_AGENT_BASE
         requests_per_second = anonymous_requests_per_second
@@ -147,6 +175,8 @@ class OpenLibraryProvider(HttpJsonProvider):
             base_url=base_url,
             timeout=timeout,
             max_retries=max_retries,
+            retry_wait_multiplier_seconds=retry_wait_multiplier_seconds,
+            retry_wait_max_seconds=retry_wait_max_seconds,
             requests_per_second=requests_per_second,
             user_agent=user_agent,
         )
@@ -252,14 +282,19 @@ class GoogleBooksProvider(HttpJsonProvider):
         api_key: str | None,
         max_retries: int,
         requests_per_second: float,
+        retry_wait_multiplier_seconds: float = 1.0,
+        retry_wait_max_seconds: float = 30.0,
     ):
         super().__init__(
             base_url=base_url,
             timeout=timeout,
             max_retries=max_retries,
+            retry_wait_multiplier_seconds=retry_wait_multiplier_seconds,
+            retry_wait_max_seconds=retry_wait_max_seconds,
             requests_per_second=requests_per_second,
         )
         self.api_key = api_key
+        self._unavailable_error: ProviderUnavailableError | None = None
 
     def _safe_url(self, url: str) -> str:
         parts = urlsplit(url)
@@ -273,6 +308,8 @@ class GoogleBooksProvider(HttpJsonProvider):
         author: str,
         isbn: str | None = None,
     ) -> MetadataCandidate | None:
+        if self._unavailable_error is not None:
+            raise self._unavailable_error
         query_key = metadata_query_key(title=title, author=author, isbn=isbn)
         clean_isbn = _clean_isbn(isbn)
         if clean_isbn:
@@ -287,6 +324,19 @@ class GoogleBooksProvider(HttpJsonProvider):
         if candidate is not None:
             return replace(candidate, query_key=query_key)
         return None
+
+    def _http_error(self, status: int, url: str, body: str | None) -> ProviderError:
+        if status == 429 and _is_terminal_google_quota_error(body):
+            error = ProviderUnavailableError(
+                "googlebooks daily quota is disabled or exhausted; "
+                "the provider is disabled for the remainder of this run"
+            )
+            self._unavailable_error = error
+            return error
+        safe_body = body
+        if safe_body and self.api_key:
+            safe_body = safe_body.replace(self.api_key, "[REDACTED]")
+        return super()._http_error(status, url, safe_body)
 
     def _search(self, *, query: str, title: str, author: str) -> MetadataCandidate | None:
         params: dict[str, Any] = {"q": query, "maxResults": 5, "printType": "books"}
@@ -396,6 +446,78 @@ def _google_isbn(identifiers: list[dict[str, Any]]) -> str | None:
     return by_type.get("ISBN_13") or by_type.get("ISBN_10")
 
 
+def _is_terminal_google_quota_error(body: str | None) -> bool:
+    if not body:
+        return False
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        payload = None
+
+    def values(value: Any):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                yield str(key), item
+                yield from values(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from values(item)
+
+    if payload is not None:
+        for key, value in values(payload):
+            normalized_key = "".join(character for character in key.lower() if character.isalnum())
+            if normalized_key == "quotalimitvalue" and str(value).strip() == "0":
+                return True
+            if normalized_key == "reason" and str(value).lower() == "dailylimitexceeded":
+                return True
+
+    lowered = body.lower()
+    return "queries per day" in lowered or "daily quota" in lowered
+
+
+def resolve_api_key(config: dict[str, Any]) -> str:
+    command = config.get("api_key_command")
+    if command is not None:
+        if (
+            not command
+            or not isinstance(command, list)
+            or not all(isinstance(part, str) and part for part in command)
+        ):
+            raise ProviderConfigurationError(
+                "googlebooks api_key_command must be a non-empty list of strings"
+            )
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=config.get("api_key_command_timeout_seconds"),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProviderConfigurationError(
+                f"googlebooks api_key_command could not be executed: {exc}"
+            ) from exc
+        if result.returncode != 0:
+            detail = result.stderr.strip()
+            suffix = f": {detail}" if detail else ""
+            raise ProviderConfigurationError(
+                f"googlebooks api_key_command exited with status {result.returncode}{suffix}"
+            )
+        api_key = result.stdout.strip()
+        if not api_key:
+            raise ProviderConfigurationError("googlebooks api_key_command returned an empty value")
+        return api_key
+
+    api_key = config.get("api_key")
+    if isinstance(api_key, str) and api_key.strip():
+        return api_key.strip()
+    raise ProviderConfigurationError(
+        "googlebooks is enabled but no credentials are configured; "
+        "set metadata.googlebooks.api_key_command (preferred) or api_key"
+    )
+
+
 def make_metadata_provider(name: str, config: dict[str, Any]) -> MetadataProvider:
     if name == "openlibrary":
         return OpenLibraryProvider(
@@ -403,15 +525,19 @@ def make_metadata_provider(name: str, config: dict[str, Any]) -> MetadataProvide
             contact=config.get("contact"),
             timeout=float(config["timeout_seconds"]),
             max_retries=int(config["max_retries"]),
+            retry_wait_multiplier_seconds=float(config["retry_wait_multiplier_seconds"]),
+            retry_wait_max_seconds=float(config["retry_wait_max_seconds"]),
             anonymous_requests_per_second=float(config["anonymous_requests_per_second"]),
             identified_requests_per_second=float(config["identified_requests_per_second"]),
         )
     if name == "googlebooks":
         return GoogleBooksProvider(
             base_url=str(config["base_url"]),
-            api_key=config.get("api_key"),
+            api_key=resolve_api_key(config),
             timeout=float(config["timeout_seconds"]),
             max_retries=int(config["max_retries"]),
+            retry_wait_multiplier_seconds=float(config["retry_wait_multiplier_seconds"]),
+            retry_wait_max_seconds=float(config["retry_wait_max_seconds"]),
             requests_per_second=float(config["requests_per_second"]),
         )
     raise ValueError(f"unknown metadata provider: {name}")
