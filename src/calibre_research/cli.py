@@ -140,7 +140,12 @@ def metadata(
 
     effective_limit = limit
     if "openlibrary" in provider_names:
-        max_books = cfg.metadata.openlibrary.max_books_per_run
+        openlibrary_settings = cfg.metadata.openlibrary
+        if openlibrary_settings is None:
+            raise typer.Exit(
+                code=_print_error("metadata provider 'openlibrary' has no configuration section")
+            )
+        max_books = openlibrary_settings.max_books_per_run
         if effective_limit is None:
             effective_limit = max_books
         elif effective_limit > max_books:
