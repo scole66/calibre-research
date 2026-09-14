@@ -15,6 +15,5 @@ components:
     max: 10
   personal_interest:
     max: 15
-    default: 7
   discovery_bonus:
     max: 5

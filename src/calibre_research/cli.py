@@ -14,6 +14,23 @@ from .config import load_config
 from .db import Database
 from .metadata import build_proposals, candidate_from_normalized, classify_unresolved
 from .providers import ProviderError, make_metadata_provider, metadata_query_key
+from .scoring import assessed_maximum, load_rubric, score_work
+from .significance import (
+    CACHED_METADATA_CLAIM_CATEGORIES,
+    CACHED_METADATA_FACT_FIELDS,
+    build_about,
+    build_why_read,
+    claims_by_category,
+    evidence_coverage,
+    facts_by_name,
+    research_from_cached_metadata,
+)
+from .wikidata import (
+    WIKIDATA_CLAIM_CATEGORIES,
+    WIKIDATA_FACT_FIELDS,
+    WikidataAwardProvider,
+    combine_results,
+)
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
@@ -361,6 +378,7 @@ def research(
     depth: Annotated[str, typer.Option("--depth", help="metadata|significance|full")] = "full",
     limit: Annotated[int | None, typer.Option("--limit")] = None,
     budget: Annotated[float | None, typer.Option("--budget")] = None,
+    refresh: Annotated[bool, typer.Option("--refresh", help="Recompute existing scores.")] = False,
     config: ConfigOpt = None,
 ):
     if depth not in {"metadata", "significance", "full"}:
@@ -369,26 +387,114 @@ def research(
     db = Database(cfg.database_path)
     db.initialize()
     effective_budget = budget if budget is not None else cfg.research.max_cost_per_run_usd
+    if depth == "metadata":
+        console.print("Use [bold]calibre-research metadata[/bold] for metadata research.")
+        return
 
-    with db.connect() as con:
-        query = """
-            SELECT w.id, w.canonical_title, w.canonical_author
-            FROM works w
-            WHERE NOT EXISTS (SELECT 1 FROM facts f WHERE f.work_id=w.id)
-              AND NOT EXISTS (SELECT 1 FROM significance_claims s WHERE s.work_id=w.id)
-            ORDER BY w.id
-        """
-        params: tuple = ()
-        if limit is not None:
-            query += " LIMIT ?"
-            params = (limit,)
-        rows = con.execute(query, params).fetchall()
-
-    console.print(
-        f"Research provider [bold]{cfg.research.provider}[/bold]; "
-        f"depth={depth}; budget=${effective_budget:.2f}; candidates={len(rows)}"
+    rubric = load_rubric(Path(cfg.rubric))
+    rubric_version = str(rubric["version"])
+    rows = db.significance_candidates(
+        rubric_version=rubric_version,
+        refresh=refresh,
+        limit=limit,
     )
-    console.print("Significance provider integration is intentionally stubbed.")
+    console.print(
+        f"Significance research from cached metadata; rubric={rubric_version}; "
+        f"cost=$0.00; candidates={len(rows)}"
+    )
+    if effective_budget < 0:
+        raise typer.Exit(code=_print_error("Research budget cannot be negative"))
+    if not rows:
+        console.print("No works with current metadata matches require scoring.")
+        return
+
+    for row in rows:
+        lookups = db.cached_metadata_matches_for_work(work_id=row["work_id"])
+        result = research_from_cached_metadata(
+            title=row["title"],
+            author=row["author"],
+            lookups=lookups,
+        )
+        managed_fact_fields = set(CACHED_METADATA_FACT_FIELDS)
+        managed_claim_categories = set(CACHED_METADATA_CLAIM_CATEGORIES)
+        if cfg.research.wikidata.enabled:
+            try:
+                wikidata_result = WikidataAwardProvider(cfg.research.wikidata).research(
+                    title=row["title"], author=row["author"]
+                )
+            except ProviderError as exc:
+                console.print(f"[yellow]warning:[/yellow] {exc}")
+            else:
+                result = combine_results(result, wikidata_result)
+                managed_fact_fields.update(WIKIDATA_FACT_FIELDS)
+                managed_claim_categories.update(WIKIDATA_CLAIM_CATEGORIES)
+        facts = facts_by_name(result)
+        total, components = score_work(
+            rubric=rubric,
+            claims_by_category=claims_by_category(result),
+        )
+        confidence = evidence_coverage(rubric=rubric, result=result, facts=facts)
+        why_read = build_why_read(claims=result.claims)
+        about = build_about(facts=facts)
+        db.store_research_result(
+            work_id=row["work_id"],
+            result=result,
+            managed_fact_fields=managed_fact_fields,
+            managed_claim_categories=managed_claim_categories,
+        )
+        db.store_score(
+            work_id=row["work_id"],
+            rubric_version=rubric_version,
+            total=total,
+            confidence=confidence,
+            components=components,
+            why_read=why_read,
+        )
+        console.print()
+        console.print(f"[bold]{row['title']}[/bold] — {row['author']}")
+        assessed_max = assessed_maximum(components)
+        if assessed_max:
+            console.print(
+                f"  provisional worthiness: {_display_score(total)}/"
+                f"{_display_score(assessed_max)} assessed points"
+            )
+        else:
+            console.print("  worthiness: not yet rated")
+        console.print(f"  confidence: {confidence:.0%}")
+        console.print(f"  why read: {why_read}")
+        if about:
+            console.print(f"  about: {about}")
+
+
+@app.command("next")
+def next_books(
+    limit: Annotated[int, typer.Option("--limit", min=1)] = 25,
+    config: ConfigOpt = None,
+):
+    """Rank researched works by their current worthiness score."""
+    cfg = _load(config)
+    db = _db(cfg.database_path)
+    db.initialize()
+    rubric = load_rubric(Path(cfg.rubric))
+    rubric_version = str(rubric["version"])
+    rows = db.ranked_scores(rubric_version=rubric_version, limit=limit)
+    if not rows:
+        console.print("No worthiness scores are available. Run significance research first.")
+        return
+
+    console.print(f"[bold]What to read next[/bold] [dim](rubric {rubric_version})[/dim]")
+    for position, row in enumerate(rows, start=1):
+        console.print()
+        console.print(f"[bold]{position}. {row['title']}[/bold] — {row['author']}")
+        assessed_max = assessed_maximum(row["components"])
+        if assessed_max:
+            rating = (
+                f"{_display_score(row['total'])}/{_display_score(assessed_max)} assessed points"
+            )
+        else:
+            rating = "not yet rated"
+        console.print(f"   Worthiness: {rating}; confidence: {row['confidence']:.0%}")
+        console.print(f"   {row['why_read']}")
 
 
 @app.command()
@@ -442,10 +548,47 @@ def explain(query: str, config: ConfigOpt = None):
     if row["total"] is None:
         console.print("Not scored yet.")
         return
-    console.print(f"Score: {row['total']} (rubric {row['rubric_version']})")
+    components = json.loads(row["components_json"])
+    assessed_max = assessed_maximum(components)
+    if assessed_max:
+        console.print(
+            f"Provisional worthiness: {_display_score(row['total'])}/"
+            f"{_display_score(assessed_max)} assessed points (rubric {row['rubric_version']})"
+        )
+    else:
+        console.print(f"Worthiness: not yet rated (rubric {row['rubric_version']})")
     console.print(f"Confidence: {row['confidence']}")
     console.print(f"Why read: {row['why_read'] or '-'}")
-    console.print(json.dumps(json.loads(row["components_json"]), indent=2))
+    console.print(json.dumps(components, indent=2))
+
+    with db.connect() as con:
+        claims = con.execute(
+            """
+            SELECT category, claim, confidence
+            FROM significance_claims
+            WHERE work_id=? AND status='RESEARCHED'
+            ORDER BY category, id
+            """,
+            (row["id"],),
+        ).fetchall()
+        evidence = con.execute(
+            """
+            SELECT DISTINCT source_name, source_url, citation_text
+            FROM evidence
+            WHERE work_id=?
+            ORDER BY source_name, source_url
+            """,
+            (row["id"],),
+        ).fetchall()
+    if claims:
+        console.print("[bold]Claims[/bold]")
+        for claim in claims:
+            console.print(f"  {claim['category']}: {claim['claim']} ({claim['confidence']:.2f})")
+    if evidence:
+        console.print("[bold]Sources (including unscored context)[/bold]")
+        for item in evidence:
+            label = item["source_name"] or item["citation_text"] or "Source"
+            console.print(f"  {label}: {item['source_url'] or '-'}")
 
 
 def _print_metadata_header(edition: dict) -> None:
@@ -460,6 +603,10 @@ def _display_value(value) -> str:
     if isinstance(value, str) and value.startswith("0101-01-01"):
         return "[dim]<missing>[/dim]"
     return str(value)
+
+
+def _display_score(value: float) -> str:
+    return f"{value:.1f}".removesuffix(".0")
 
 
 def _print_error(message: str) -> int:

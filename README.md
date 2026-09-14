@@ -444,7 +444,34 @@ diagnostic while standard output is discarded.
 
 ## Significance research
 
-Later research will collect information such as:
+The significance pipeline first preserves useful context from cached metadata without making
+network requests:
+
+```bash
+uv run calibre-research research --depth significance --limit 25
+uv run calibre-research next --limit 10
+```
+
+Current structured facts include Google Books descriptions, categories, average ratings and rating
+counts, plus original-publication years already identified through metadata research. Descriptions
+are displayed as `about` context; they do not contribute to worthiness and are never presented as a
+reason to read the book.
+
+`why_read` is deliberately stricter: it is synthesized only from evidence-backed significance
+claims that contribute to the rubric. If none have been found, the tool says so. A low-coverage
+score is provisional rather than evidence that a book is unworthy; absent data is not interpreted
+as a negative finding.
+
+When enabled, Wikidata supplies free, credential-free award and nomination data from structured
+`award received` and `nominated for` statements. Work identity must match both title and author
+before a claim is accepted. Positive records contribute rubric points; a missing record does not
+prove that no award exists.
+
+Scores expose the state of every component. An unresearched component is `unknown`, not zero. Until
+at least one component is assessed, output says `worthiness: not yet rated`; researched results are
+shown against the assessed portion of the rubric, for example `8/25 assessed points`.
+
+Later research will also collect information such as:
 
 * major awards and nominations
 * critical reputation

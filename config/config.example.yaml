@@ -2,11 +2,16 @@ database: ~/.local/share/calibre-research/research.sqlite3
 rubric: ./config/rubric-1.0.yaml
 
 research:
-  provider: stub
   max_cost_per_run_usd: 5.00
   max_cost_per_book_usd: 0.10
   web_search_enabled: true
   reuse_cached_evidence: true
+  wikidata:
+    # Free, credential-free structured award and nomination research.
+    enabled: true
+    base_url: https://www.wikidata.org/w/api.php
+    timeout_seconds: 15.0
+    max_candidates: 5
 
 metadata:
   # Providers listed here are enabled and tried in order. Later providers are
