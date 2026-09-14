@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .metadata import MetadataCandidate, MetadataProposal, dump_json, metadata_query_key
+from .models import EvidenceItem, ResearchResult
 
 
 @dataclass(frozen=True)
@@ -393,6 +394,238 @@ class Database:
                 """,
                 (edition_id,),
             )
+
+    def significance_candidates(
+        self, *, rubric_version: str, refresh: bool = False, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT w.id AS work_id, w.canonical_title AS title,
+                   w.canonical_author AS author
+            FROM works w
+            WHERE EXISTS (
+                SELECT 1
+                FROM editions e
+                JOIN metadata_lookups ml ON ml.edition_id=e.id
+                WHERE e.work_id=w.id
+                  AND ml.status='MATCH'
+                  AND ml.query_key=metadata_query_key(e.title, e.author, e.isbn)
+            )
+        """
+        params: list[Any] = []
+        if not refresh:
+            query += """
+                AND NOT EXISTS (
+                    SELECT 1 FROM scores s
+                    WHERE s.work_id=w.id AND s.rubric_version=?
+                )
+            """
+            params.append(rubric_version)
+        query += " ORDER BY w.id"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self.connect() as con:
+            return [dict(row) for row in con.execute(query, params).fetchall()]
+
+    def cached_metadata_matches_for_work(self, *, work_id: int) -> list[dict[str, Any]]:
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT ml.provider, ml.source_url, ml.identity_confidence,
+                       ml.raw_json, ml.normalized_json, ml.retrieved_at
+                FROM editions e
+                JOIN metadata_lookups ml ON ml.edition_id=e.id
+                WHERE e.work_id=?
+                  AND ml.status='MATCH'
+                  AND ml.query_key=metadata_query_key(e.title, e.author, e.isbn)
+                ORDER BY CASE ml.provider WHEN 'googlebooks' THEN 0 ELSE 1 END,
+                         ml.identity_confidence DESC,
+                         ml.retrieved_at DESC
+                """,
+                (work_id,),
+            ).fetchall()
+        return [
+            {
+                "provider": row["provider"],
+                "source_url": row["source_url"],
+                "identity_confidence": row["identity_confidence"],
+                "raw": json.loads(row["raw_json"]),
+                "normalized": json.loads(row["normalized_json"]),
+                "retrieved_at": row["retrieved_at"],
+            }
+            for row in rows
+        ]
+
+    def store_research_result(
+        self,
+        *,
+        work_id: int,
+        result: ResearchResult,
+        managed_fact_fields: set[str] | None = None,
+        managed_claim_categories: set[str] | None = None,
+    ) -> None:
+        with self.connect() as con:
+            if managed_fact_fields:
+                placeholders = ", ".join("?" for _ in managed_fact_fields)
+                con.execute(
+                    f"""
+                    UPDATE facts SET status='SUPERSEDED', updated_at=CURRENT_TIMESTAMP
+                    WHERE work_id=? AND status='RESEARCHED'
+                      AND field_name IN ({placeholders})
+                    """,
+                    (work_id, *sorted(managed_fact_fields)),
+                )
+            if managed_claim_categories:
+                placeholders = ", ".join("?" for _ in managed_claim_categories)
+                con.execute(
+                    f"""
+                    UPDATE significance_claims
+                    SET status='SUPERSEDED', updated_at=CURRENT_TIMESTAMP
+                    WHERE work_id=? AND status='RESEARCHED'
+                      AND category IN ({placeholders})
+                    """,
+                    (work_id, *sorted(managed_claim_categories)),
+                )
+            for fact in result.facts:
+                con.execute(
+                    """
+                    INSERT INTO facts(work_id, field_name, value_json, confidence, note)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(work_id, field_name) DO UPDATE SET
+                        value_json=excluded.value_json,
+                        confidence=excluded.confidence,
+                        note=excluded.note,
+                        status='RESEARCHED',
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    (work_id, fact.field_name, dump_json(fact.value), fact.confidence, fact.note),
+                )
+                fact_id = con.execute(
+                    "SELECT id FROM facts WHERE work_id=? AND field_name=?",
+                    (work_id, fact.field_name),
+                ).fetchone()["id"]
+                con.execute("DELETE FROM fact_evidence WHERE fact_id=?", (fact_id,))
+                for item in fact.evidence:
+                    evidence_id = self._store_evidence(con, work_id=work_id, item=item)
+                    con.execute(
+                        "INSERT OR IGNORE INTO fact_evidence(fact_id, evidence_id) VALUES (?, ?)",
+                        (fact_id, evidence_id),
+                    )
+
+            for claim in result.claims:
+                row = con.execute(
+                    """
+                    SELECT id FROM significance_claims
+                    WHERE work_id=? AND category=? AND claim=?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (work_id, claim.category, claim.claim),
+                ).fetchone()
+                if row is None:
+                    claim_id = con.execute(
+                        """
+                        INSERT INTO significance_claims(work_id, category, claim, confidence)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (work_id, claim.category, claim.claim, claim.confidence),
+                    ).lastrowid
+                else:
+                    claim_id = row["id"]
+                    con.execute(
+                        """
+                        UPDATE significance_claims
+                        SET confidence=?, status='RESEARCHED', updated_at=CURRENT_TIMESTAMP
+                        WHERE id=?
+                        """,
+                        (claim.confidence, claim_id),
+                    )
+                con.execute("DELETE FROM claim_evidence WHERE claim_id=?", (claim_id,))
+                for item in claim.evidence:
+                    evidence_id = self._store_evidence(con, work_id=work_id, item=item)
+                    con.execute(
+                        "INSERT OR IGNORE INTO claim_evidence(claim_id, evidence_id) VALUES (?, ?)",
+                        (claim_id, evidence_id),
+                    )
+
+    @staticmethod
+    def _store_evidence(con, *, work_id: int, item: EvidenceItem) -> int:
+        source_url = str(item.source_url) if item.source_url is not None else ""
+        citation_text = item.citation_text or ""
+        con.execute(
+            """
+            INSERT INTO evidence(work_id, source_type, source_name, source_url, citation_text)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(work_id, source_url, citation_text) DO UPDATE SET
+                source_type=excluded.source_type,
+                source_name=excluded.source_name,
+                retrieved_at=CURRENT_TIMESTAMP
+            """,
+            (work_id, item.source_type, item.source_name, source_url, citation_text),
+        )
+        return con.execute(
+            """
+            SELECT id FROM evidence
+            WHERE work_id=? AND source_url=? AND citation_text=?
+            """,
+            (work_id, source_url, citation_text),
+        ).fetchone()["id"]
+
+    def store_score(
+        self,
+        *,
+        work_id: int,
+        rubric_version: str,
+        total: float,
+        confidence: float,
+        components: dict[str, Any],
+        why_read: str,
+    ) -> None:
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT INTO scores(
+                    work_id, rubric_version, total, confidence, components_json, why_read
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(work_id, rubric_version) DO UPDATE SET
+                    total=excluded.total,
+                    confidence=excluded.confidence,
+                    components_json=excluded.components_json,
+                    why_read=excluded.why_read,
+                    scored_at=CURRENT_TIMESTAMP
+                """,
+                (work_id, rubric_version, total, confidence, dump_json(components), why_read),
+            )
+
+    def ranked_scores(self, *, rubric_version: str, limit: int) -> list[dict[str, Any]]:
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT w.canonical_title AS title, w.canonical_author AS author,
+                       s.total, s.confidence, s.why_read, s.components_json
+                FROM scores s
+                JOIN works w ON w.id=s.work_id
+                WHERE s.rubric_version=?
+                ORDER BY s.total DESC, s.confidence DESC, w.canonical_title
+                """,
+                (rubric_version,),
+            ).fetchall()
+        results = [
+            {
+                **dict(row),
+                "components": json.loads(row["components_json"]),
+            }
+            for row in rows
+        ]
+        rated = [
+            row
+            for row in results
+            if any(
+                component.get("status") == "assessed"
+                for component in row["components"].values()
+                if isinstance(component, dict)
+            )
+        ]
+        return rated[:limit]
 
 
 def _scalar_text(value: Any) -> str | None:

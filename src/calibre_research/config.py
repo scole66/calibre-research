@@ -13,6 +13,14 @@ class ResearchConfig(BaseModel):
     max_cost_per_book_usd: float = 0.10
     web_search_enabled: bool = True
     reuse_cached_evidence: bool = True
+    wikidata: WikidataConfig = Field(default_factory=lambda: WikidataConfig())
+
+
+class WikidataConfig(BaseModel):
+    enabled: bool = False
+    base_url: str = "https://www.wikidata.org/w/api.php"
+    timeout_seconds: float = 15.0
+    max_candidates: int = 5
 
 
 class OpenLibraryConfig(BaseModel):

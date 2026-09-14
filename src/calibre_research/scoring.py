@@ -10,14 +10,12 @@ def load_rubric(path: Path) -> dict:
 
 
 def score_work(
-    *, rubric: dict, claims_by_category: dict[str, list[dict]]
-) -> tuple[float, dict[str, float]]:
-    """First-pass deterministic scorer.
-
-    Only awards have concrete rules in rubric 1.0. Other categories currently
-    accept a precomputed claim score if present, otherwise zero/default.
-    """
-    components: dict[str, float] = {}
+    *,
+    rubric: dict,
+    claims_by_category: dict[str, list[dict]],
+) -> tuple[float, dict[str, dict[str, float | str]]]:
+    """Score structured evidence deterministically under a versioned rubric."""
+    components: dict[str, dict[str, float | str]] = {}
 
     awards_cfg = rubric["components"]["major_awards"]
     award_points = 0.0
@@ -27,12 +25,29 @@ def score_work(
             award_points += awards_cfg["rules"]["win"]
         elif result in {"nominee", "nominated", "finalist"}:
             award_points += awards_cfg["rules"]["nomination"]
-    components["major_awards"] = min(award_points, awards_cfg["max"])
+    award_claims = claims_by_category.get("major_awards")
+    components["major_awards"] = {
+        "score": min(award_points, awards_cfg["max"]),
+        "maximum": float(awards_cfg["max"]),
+        "status": "assessed" if award_claims else "unknown",
+    }
 
     for name, cfg in rubric["components"].items():
-        if name == "major_awards":
+        if name in components:
             continue
-        default = float(cfg.get("default", 0))
-        components[name] = min(default, float(cfg["max"]))
+        components[name] = {
+            "score": 0.0,
+            "maximum": float(cfg["max"]),
+            "status": "unknown",
+        }
 
-    return sum(components.values()), components
+    total = sum(float(component["score"]) for component in components.values())
+    return total, components
+
+
+def assessed_maximum(components: dict[str, dict[str, float | str]]) -> float:
+    return sum(
+        float(component["maximum"])
+        for component in components.values()
+        if isinstance(component, dict) and component.get("status") == "assessed"
+    )
