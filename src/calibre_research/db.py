@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .metadata import MetadataCandidate, MetadataProposal, dump_json, metadata_query_key
-from .models import EvidenceItem, ResearchResult
+from .models import AwardEvidence, EvidenceItem, ResearchResult
 
 
 @dataclass(frozen=True)
@@ -396,7 +396,12 @@ class Database:
             )
 
     def significance_candidates(
-        self, *, rubric_version: str, refresh: bool = False, limit: int | None = None
+        self,
+        *,
+        rubric_version: str,
+        refresh: bool = False,
+        limit: int | None = None,
+        retry_error_providers: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         query = """
             SELECT w.id AS work_id, w.canonical_title AS title,
@@ -413,19 +418,60 @@ class Database:
         """
         params: list[Any] = []
         if not refresh:
-            query += """
-                AND NOT EXISTS (
-                    SELECT 1 FROM scores s
-                    WHERE s.work_id=w.id AND s.rubric_version=?
-                )
-            """
+            query += """ AND (NOT EXISTS (
+                    SELECT 1 FROM derived_scores s
+                    WHERE s.work_id=w.id AND s.score_kind='significance'
+                      AND s.rubric_version=?
+                )"""
             params.append(rubric_version)
+            if retry_error_providers:
+                placeholders = ", ".join("?" for _ in retry_error_providers)
+                query += f"""
+                    OR EXISTS (
+                        SELECT 1 FROM significance_provider_attempts spa
+                        WHERE spa.work_id=w.id AND spa.status='ERROR'
+                          AND spa.provider IN ({placeholders})
+                    )
+                """
+                params.extend(retry_error_providers)
+                for provider in retry_error_providers:
+                    query += """
+                        OR NOT EXISTS (
+                            SELECT 1 FROM significance_provider_attempts spa
+                            WHERE spa.work_id=w.id AND spa.provider=?
+                        )
+                    """
+                    params.append(provider)
+            query += ")"
         query += " ORDER BY w.id"
         if limit is not None:
             query += " LIMIT ?"
             params.append(limit)
         with self.connect() as con:
             return [dict(row) for row in con.execute(query, params).fetchall()]
+
+    def record_significance_provider_attempt(
+        self,
+        *,
+        work_id: int,
+        provider: str,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        if status not in {"MATCH", "MISS", "ERROR"}:
+            raise ValueError(f"Unknown significance provider status: {status}")
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT INTO significance_provider_attempts(work_id, provider, status, error)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(work_id, provider) DO UPDATE SET
+                    status=excluded.status,
+                    error=excluded.error,
+                    attempted_at=CURRENT_TIMESTAMP
+                """,
+                (work_id, provider, status, error),
+            )
 
     def cached_metadata_matches_for_work(self, *, work_id: int) -> list[dict[str, Any]]:
         with self.connect() as con:
@@ -463,6 +509,7 @@ class Database:
         result: ResearchResult,
         managed_fact_fields: set[str] | None = None,
         managed_claim_categories: set[str] | None = None,
+        managed_award_sources: set[str] | None = None,
     ) -> None:
         with self.connect() as con:
             if managed_fact_fields:
@@ -485,6 +532,17 @@ class Database:
                       AND category IN ({placeholders})
                     """,
                     (work_id, *sorted(managed_claim_categories)),
+                )
+            if managed_award_sources:
+                placeholders = ", ".join("?" for _ in managed_award_sources)
+                con.execute(
+                    f"""
+                    UPDATE award_evidence
+                    SET status='SUPERSEDED'
+                    WHERE work_id=? AND status='RESEARCHED'
+                      AND source_name IN ({placeholders})
+                    """,
+                    (work_id, *sorted(managed_award_sources)),
                 )
             for fact in result.facts:
                 con.execute(
@@ -547,6 +605,35 @@ class Database:
                         (claim_id, evidence_id),
                     )
 
+            for award in result.awards:
+                con.execute(
+                    """
+                    INSERT INTO award_evidence(
+                        work_id, award_name, award_year, category, result,
+                        source_name, source_identifier, source_url, confidence
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(work_id, source_name, source_identifier, result) DO UPDATE SET
+                        award_name=excluded.award_name,
+                        award_year=excluded.award_year,
+                        category=excluded.category,
+                        source_url=excluded.source_url,
+                        confidence=excluded.confidence,
+                        status='RESEARCHED',
+                        retrieved_at=CURRENT_TIMESTAMP
+                    """,
+                    (
+                        work_id,
+                        award.award_name,
+                        award.year,
+                        award.category,
+                        award.result,
+                        award.source_name,
+                        award.source_identifier,
+                        str(award.source_url) if award.source_url else None,
+                        award.confidence,
+                    ),
+                )
+
     @staticmethod
     def _store_evidence(con, *, work_id: int, item: EvidenceItem) -> int:
         source_url = str(item.source_url) if item.source_url is not None else ""
@@ -570,41 +657,77 @@ class Database:
             (work_id, source_url, citation_text),
         ).fetchone()["id"]
 
-    def store_score(
+    def store_derived_score(
         self,
         *,
         work_id: int,
+        score_kind: str,
         rubric_version: str,
         total: float,
         confidence: float,
         components: dict[str, Any],
-        why_read: str,
+        explanation: str,
     ) -> None:
         with self.connect() as con:
             con.execute(
                 """
-                INSERT INTO scores(
-                    work_id, rubric_version, total, confidence, components_json, why_read
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(work_id, rubric_version) DO UPDATE SET
+                INSERT INTO derived_scores(
+                    work_id, score_kind, rubric_version, total, confidence,
+                    components_json, explanation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(work_id, score_kind, rubric_version) DO UPDATE SET
                     total=excluded.total,
                     confidence=excluded.confidence,
                     components_json=excluded.components_json,
-                    why_read=excluded.why_read,
+                    explanation=excluded.explanation,
                     scored_at=CURRENT_TIMESTAMP
                 """,
-                (work_id, rubric_version, total, confidence, dump_json(components), why_read),
+                (
+                    work_id,
+                    score_kind,
+                    rubric_version,
+                    total,
+                    confidence,
+                    dump_json(components),
+                    explanation,
+                ),
             )
+
+    def award_evidence_for_work(self, *, work_id: int) -> list[AwardEvidence]:
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT award_name, award_year, category, result, source_name,
+                       source_identifier, source_url, confidence
+                FROM award_evidence
+                WHERE work_id=? AND status='RESEARCHED'
+                ORDER BY award_year, award_name, result
+                """,
+                (work_id,),
+            ).fetchall()
+        return [
+            AwardEvidence(
+                award_name=row["award_name"],
+                year=row["award_year"],
+                category=row["category"],
+                result=row["result"],
+                source_name=row["source_name"],
+                source_identifier=row["source_identifier"],
+                source_url=row["source_url"],
+                confidence=row["confidence"],
+            )
+            for row in rows
+        ]
 
     def ranked_scores(self, *, rubric_version: str, limit: int) -> list[dict[str, Any]]:
         with self.connect() as con:
             rows = con.execute(
                 """
                 SELECT w.canonical_title AS title, w.canonical_author AS author,
-                       s.total, s.confidence, s.why_read, s.components_json
-                FROM scores s
+                       s.total, s.confidence, s.explanation, s.components_json
+                FROM derived_scores s
                 JOIN works w ON w.id=s.work_id
-                WHERE s.rubric_version=?
+                WHERE s.score_kind='significance' AND s.rubric_version=?
                 ORDER BY s.total DESC, s.confidence DESC, w.canonical_title
                 """,
                 (rubric_version,),

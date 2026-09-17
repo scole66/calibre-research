@@ -14,19 +14,17 @@ from .config import load_config
 from .db import Database
 from .metadata import build_proposals, candidate_from_normalized, classify_unresolved
 from .providers import ProviderError, make_metadata_provider, metadata_query_key
-from .scoring import assessed_maximum, load_rubric, score_work
+from .scoring import assessed_maximum, load_rubric, score_significance
 from .significance import (
     CACHED_METADATA_CLAIM_CATEGORIES,
     CACHED_METADATA_FACT_FIELDS,
     build_about,
-    build_why_read,
-    claims_by_category,
+    build_significance_explanation,
     evidence_coverage,
     facts_by_name,
     research_from_cached_metadata,
 )
 from .wikidata import (
-    WIKIDATA_CLAIM_CATEGORIES,
     WIKIDATA_FACT_FIELDS,
     WikidataAwardProvider,
     combine_results,
@@ -360,7 +358,10 @@ def stats(config: ConfigOpt = None):
             "Facts": con.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
             "Evidence": con.execute("SELECT COUNT(*) FROM evidence").fetchone()[0],
             "Claims": con.execute("SELECT COUNT(*) FROM significance_claims").fetchone()[0],
-            "Scores": con.execute("SELECT COUNT(*) FROM scores").fetchone()[0],
+            "Award evidence": con.execute(
+                "SELECT COUNT(*) FROM award_evidence WHERE status='RESEARCHED'"
+            ).fetchone()[0],
+            "Derived scores": con.execute("SELECT COUNT(*) FROM derived_scores").fetchone()[0],
             "Review queue": con.execute(
                 "SELECT COUNT(*) FROM review_queue WHERE status='OPEN'"
             ).fetchone()[0],
@@ -393,10 +394,12 @@ def research(
 
     rubric = load_rubric(Path(cfg.rubric))
     rubric_version = str(rubric["version"])
+    enabled_significance_providers = ["wikidata"] if cfg.research.wikidata.enabled else []
     rows = db.significance_candidates(
         rubric_version=rubric_version,
         refresh=refresh,
         limit=limit,
+        retry_error_providers=enabled_significance_providers,
     )
     console.print(
         f"Significance research from cached metadata; rubric={rubric_version}; "
@@ -408,6 +411,9 @@ def research(
         console.print("No works with current metadata matches require scoring.")
         return
 
+    wikidata = (
+        WikidataAwardProvider(cfg.research.wikidata) if cfg.research.wikidata.enabled else None
+    )
     for row in rows:
         lookups = db.cached_metadata_matches_for_work(work_id=row["work_id"])
         result = research_from_cached_metadata(
@@ -417,51 +423,65 @@ def research(
         )
         managed_fact_fields = set(CACHED_METADATA_FACT_FIELDS)
         managed_claim_categories = set(CACHED_METADATA_CLAIM_CATEGORIES)
-        if cfg.research.wikidata.enabled:
+        managed_award_sources: set[str] = set()
+        if wikidata is not None:
             try:
-                wikidata_result = WikidataAwardProvider(cfg.research.wikidata).research(
-                    title=row["title"], author=row["author"]
-                )
+                wikidata_result = wikidata.research(title=row["title"], author=row["author"])
             except ProviderError as exc:
                 console.print(f"[yellow]warning:[/yellow] {exc}")
+                db.record_significance_provider_attempt(
+                    work_id=row["work_id"],
+                    provider="wikidata",
+                    status="ERROR",
+                    error=str(exc),
+                )
+                continue
             else:
                 result = combine_results(result, wikidata_result)
                 managed_fact_fields.update(WIKIDATA_FACT_FIELDS)
-                managed_claim_categories.update(WIKIDATA_CLAIM_CATEGORIES)
-        facts = facts_by_name(result)
-        total, components = score_work(
-            rubric=rubric,
-            claims_by_category=claims_by_category(result),
-        )
-        confidence = evidence_coverage(rubric=rubric, result=result, facts=facts)
-        why_read = build_why_read(claims=result.claims)
-        about = build_about(facts=facts)
+                managed_award_sources.add("Wikidata")
         db.store_research_result(
             work_id=row["work_id"],
             result=result,
             managed_fact_fields=managed_fact_fields,
             managed_claim_categories=managed_claim_categories,
+            managed_award_sources=managed_award_sources,
         )
-        db.store_score(
+        if wikidata is not None:
+            db.record_significance_provider_attempt(
+                work_id=row["work_id"],
+                provider="wikidata",
+                status="MATCH" if wikidata_result.identity_confidence > 0 else "MISS",
+            )
+        awards = db.award_evidence_for_work(work_id=row["work_id"])
+        scored_result = result.model_copy(update={"awards": awards})
+        facts = facts_by_name(result)
+        total, components = score_significance(rubric=rubric, awards=awards)
+        confidence = evidence_coverage(rubric=rubric, result=scored_result, facts=facts)
+        explanation = build_significance_explanation(awards=awards)
+        about = build_about(facts=facts)
+        db.store_derived_score(
             work_id=row["work_id"],
+            score_kind="significance",
             rubric_version=rubric_version,
             total=total,
             confidence=confidence,
             components=components,
-            why_read=why_read,
+            explanation=explanation,
         )
         console.print()
         console.print(f"[bold]{row['title']}[/bold] — {row['author']}")
         assessed_max = assessed_maximum(components)
         if assessed_max:
             console.print(
-                f"  provisional worthiness: {_display_score(total)}/"
+                f"  provisional significance: {_display_score(total)}/"
                 f"{_display_score(assessed_max)} assessed points"
             )
         else:
-            console.print("  worthiness: not yet rated")
+            console.print("  significance: not yet rated")
         console.print(f"  confidence: {confidence:.0%}")
-        console.print(f"  why read: {why_read}")
+        console.print(f"  significance evidence: {explanation}")
+        console.print("  personal read score: unavailable")
         if about:
             console.print(f"  about: {about}")
 
@@ -471,7 +491,7 @@ def next_books(
     limit: Annotated[int, typer.Option("--limit", min=1)] = 25,
     config: ConfigOpt = None,
 ):
-    """Rank researched works by their current worthiness score."""
+    """Rank works by significance; this is not yet a personal recommendation."""
     cfg = _load(config)
     db = _db(cfg.database_path)
     db.initialize()
@@ -479,10 +499,10 @@ def next_books(
     rubric_version = str(rubric["version"])
     rows = db.ranked_scores(rubric_version=rubric_version, limit=limit)
     if not rows:
-        console.print("No worthiness scores are available. Run significance research first.")
+        console.print("No significance scores are available. Run significance research first.")
         return
 
-    console.print(f"[bold]What to read next[/bold] [dim](rubric {rubric_version})[/dim]")
+    console.print(f"[bold]Significance ranking[/bold] [dim](rubric {rubric_version})[/dim]")
     for position, row in enumerate(rows, start=1):
         console.print()
         console.print(f"[bold]{position}. {row['title']}[/bold] — {row['author']}")
@@ -493,8 +513,8 @@ def next_books(
             )
         else:
             rating = "not yet rated"
-        console.print(f"   Worthiness: {rating}; confidence: {row['confidence']:.0%}")
-        console.print(f"   {row['why_read']}")
+        console.print(f"   Significance: {rating}; confidence: {row['confidence']:.0%}")
+        console.print(f"   {row['explanation']}")
 
 
 @app.command()
@@ -536,7 +556,8 @@ def explain(query: str, config: ConfigOpt = None):
         row = con.execute(
             """
             SELECT w.id, w.canonical_title, w.canonical_author, s.*
-            FROM works w LEFT JOIN scores s ON s.work_id=w.id
+            FROM works w LEFT JOIN derived_scores s
+              ON s.work_id=w.id AND s.score_kind='significance'
             WHERE lower(w.canonical_title) LIKE lower(?)
             ORDER BY s.scored_at DESC LIMIT 1
             """,
@@ -552,13 +573,14 @@ def explain(query: str, config: ConfigOpt = None):
     assessed_max = assessed_maximum(components)
     if assessed_max:
         console.print(
-            f"Provisional worthiness: {_display_score(row['total'])}/"
+            f"Provisional significance: {_display_score(row['total'])}/"
             f"{_display_score(assessed_max)} assessed points (rubric {row['rubric_version']})"
         )
     else:
-        console.print(f"Worthiness: not yet rated (rubric {row['rubric_version']})")
+        console.print(f"Significance: not yet rated (rubric {row['rubric_version']})")
     console.print(f"Confidence: {row['confidence']}")
-    console.print(f"Why read: {row['why_read'] or '-'}")
+    console.print(f"Significance evidence: {row['explanation'] or '-'}")
+    console.print("Personal read score: unavailable")
     console.print(json.dumps(components, indent=2))
 
     with db.connect() as con:
@@ -580,6 +602,24 @@ def explain(query: str, config: ConfigOpt = None):
             """,
             (row["id"],),
         ).fetchall()
+        awards = con.execute(
+            """
+            SELECT award_name, award_year, category, result, source_name,
+                   source_identifier, source_url, confidence
+            FROM award_evidence
+            WHERE work_id=? AND status='RESEARCHED'
+            ORDER BY award_year, award_name, result
+            """,
+            (row["id"],),
+        ).fetchall()
+    if awards:
+        console.print("[bold]Award evidence[/bold]")
+        for award in awards:
+            year = f" ({award['award_year']})" if award["award_year"] else ""
+            console.print(
+                f"  {award['result']}: {award['award_name']}{year} "
+                f"[{award['source_name']}:{award['source_identifier']}]"
+            )
     if claims:
         console.print("[bold]Claims[/bold]")
         for claim in claims:

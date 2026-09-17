@@ -4,32 +4,33 @@ from pathlib import Path
 
 import yaml
 
+from .models import AwardEvidence
+
 
 def load_rubric(path: Path) -> dict:
     return yaml.safe_load(path.read_text())
 
 
-def score_work(
+def score_significance(
     *,
     rubric: dict,
-    claims_by_category: dict[str, list[dict]],
+    awards: list[AwardEvidence],
 ) -> tuple[float, dict[str, dict[str, float | str]]]:
     """Score structured evidence deterministically under a versioned rubric."""
     components: dict[str, dict[str, float | str]] = {}
 
     awards_cfg = rubric["components"]["major_awards"]
     award_points = 0.0
-    for claim in claims_by_category.get("major_awards", []):
-        result = str(claim.get("result", "")).lower()
+    for award in awards:
+        result = award.result.lower()
         if result == "winner":
             award_points += awards_cfg["rules"]["win"]
         elif result in {"nominee", "nominated", "finalist"}:
             award_points += awards_cfg["rules"]["nomination"]
-    award_claims = claims_by_category.get("major_awards")
     components["major_awards"] = {
         "score": min(award_points, awards_cfg["max"]),
         "maximum": float(awards_cfg["max"]),
-        "status": "assessed" if award_claims else "unknown",
+        "status": "assessed" if awards else "unknown",
     }
 
     for name, cfg in rubric["components"].items():

@@ -19,8 +19,13 @@ class ResearchConfig(BaseModel):
 class WikidataConfig(BaseModel):
     enabled: bool = False
     base_url: str = "https://www.wikidata.org/w/api.php"
+    contact: str = "https://github.com/scole66/calibre-research"
     timeout_seconds: float = 15.0
     max_candidates: int = 5
+    requests_per_second: float = 1.0
+    max_retries: int = 3
+    retry_wait_max_seconds: float = 60.0
+    maxlag_seconds: int = 5
 
 
 class OpenLibraryConfig(BaseModel):
@@ -63,7 +68,7 @@ class CalibreConfig(BaseModel):
 
 class AppConfig(BaseModel):
     database: str = "~/.local/share/calibre-research/research.sqlite3"
-    rubric: str = "./config/rubric-1.0.yaml"
+    rubric: str = "./config/significance-rubric-2.0.yaml"
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     metadata: MetadataConfig = Field(default_factory=MetadataConfig)
     calibre: CalibreConfig = Field(default_factory=CalibreConfig)

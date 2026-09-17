@@ -4,7 +4,7 @@ import html
 import re
 from typing import Any
 
-from .models import EvidenceItem, ResearchedFact, ResearchResult, SignificanceClaim
+from .models import AwardEvidence, EvidenceItem, ResearchedFact, ResearchResult, SignificanceClaim
 
 CACHED_METADATA_FACT_FIELDS = {
     "google_average_rating",
@@ -69,23 +69,11 @@ def facts_by_name(result: ResearchResult) -> dict[str, Any]:
     return {fact.field_name: fact.value for fact in result.facts}
 
 
-def claims_by_category(result: ResearchResult) -> dict[str, list[dict[str, Any]]]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for claim in result.claims:
-        grouped.setdefault(claim.category, []).append(
-            {
-                "claim": claim.claim,
-                "result": _claim_result(claim),
-            }
-        )
-    return grouped
-
-
 def evidence_coverage(
     *, rubric: dict[str, Any], result: ResearchResult, facts: dict[str, Any]
 ) -> float:
     evidenced: set[str] = set()
-    if any(claim.category == "major_awards" for claim in result.claims):
+    if result.awards:
         evidenced.add("major_awards")
     components = rubric["components"]
     total_weight = sum(float(component["max"]) for component in components.values())
@@ -103,9 +91,9 @@ def build_about(*, facts: dict[str, Any]) -> str | None:
     return None
 
 
-def build_why_read(*, claims: list[SignificanceClaim]) -> str:
+def build_significance_explanation(*, awards: list[AwardEvidence]) -> str:
     """Summarize only evidence-backed claims that can justify reading the work."""
-    reasons = [claim.claim for claim in claims if claim.category == "major_awards"]
+    reasons = [_award_sentence(award) for award in awards]
     if not reasons:
         return "No evidence-backed rationale available yet."
     return " ".join(reasons)
@@ -168,15 +156,11 @@ def _extract_google_books(
         )
 
 
-def _claim_result(claim: SignificanceClaim) -> str | None:
-    if claim.category != "major_awards":
-        return None
-    text = claim.claim.casefold()
-    if "won " in text or "winner" in text:
-        return "winner"
-    if "nominated" in text or "nominee" in text or "finalist" in text:
-        return "nominee"
-    return None
+def _award_sentence(award: AwardEvidence) -> str:
+    year = f" ({award.year})" if award.year is not None else ""
+    if award.result == "winner":
+        return f"Won the {award.award_name}{year}."
+    return f"{award.result.title()} for the {award.award_name}{year}."
 
 
 def _lookup_evidence(lookup: dict[str, Any]) -> EvidenceItem:

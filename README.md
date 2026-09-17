@@ -5,7 +5,9 @@
 1. **Metadata repair**
 2. **Significance research**
 
-The goal is not to curate, filter, or delete books. Instead, the tool gathers better information about each work and eventually assigns a versioned significance / “worthiness” score to help identify books that may deserve attention.
+The goal is not to curate, filter, or delete books. Instead, the tool gathers better information
+about each work and derives two deliberately separate results: a deterministic significance score
+and, later, a personal read score based on the owner's reading history and preferences.
 
 The project is intended to work well with large, messy Calibre libraries containing old ebooks, Humble Bundle acquisitions, comics, reprints, incomplete metadata, and books whose current ebook metadata does not accurately represent the original work.
 
@@ -26,6 +28,7 @@ Currently implemented:
 * metadata issue tracking with provider-error semantics
 * bounded retry and request-pacing controls
 * command-based Google Books API-key resolution
+* structured Wikidata award and nomination research
 * versioned scoring-rubric infrastructure
 * initial CLI commands
 * tests
@@ -34,9 +37,8 @@ Currently implemented:
 Planned:
 
 * LLM-assisted significance research
-* awards and historical-significance research
 * confidence scoring and review queues
-* Calibre custom fields such as `#worthiness` and `#why_read`
+* personal reading-history imports and `personal_read_score`
 * explicit synchronization of approved changes back to Calibre
 
 ## Requirements
@@ -454,21 +456,31 @@ uv run calibre-research next --limit 10
 
 Current structured facts include Google Books descriptions, categories, average ratings and rating
 counts, plus original-publication years already identified through metadata research. Descriptions
-are displayed as `about` context; they do not contribute to worthiness and are never presented as a
-reason to read the book.
+are displayed as `about` context; they do not contribute to significance.
 
-`why_read` is deliberately stricter: it is synthesized only from evidence-backed significance
-claims that contribute to the rubric. If none have been found, the tool says so. A low-coverage
-score is provisional rather than evidence that a book is unworthy; absent data is not interpreted
-as a negative finding.
+Significance explanations are generated from structured observations that contribute to the
+rubric. If none have been found, the tool says so. A low-coverage score is provisional; absent data
+is not interpreted as negative evidence.
 
 When enabled, Wikidata supplies free, credential-free award and nomination data from structured
 `award received` and `nominated for` statements. Work identity must match both title and author
-before a claim is accepted. Positive records contribute rubric points; a missing record does not
-prove that no award exists.
+before an observation is accepted. Award name, year, result, source identifier, URL, and confidence
+are stored independently of the rubric. Positive records contribute points only when the versioned
+scorer interprets them; a missing record does not prove that no award exists.
+
+Wikidata requests are serialized through one provider instance per run, conservatively paced, and
+cached in memory to avoid refetching repeated authors or awards. The client identifies itself with
+a contactable bot User-Agent, sends `maxlag=5`, honors `Retry-After` on HTTP 429/503 responses, and
+uses bounded exponential backoff when the server supplies no delay. These controls are configurable
+under `research.wikidata`; do not raise the request rate merely to make a bulk run finish sooner.
+
+Provider attempts are tracked per work. A throttling response or other provider error does not
+overwrite existing evidence or produce a completed score; that work is automatically returned to
+the next ordinary significance run. A successful lookup or confirmed miss clears the retry state.
+`--refresh` remains available when all works should be researched again.
 
 Scores expose the state of every component. An unresearched component is `unknown`, not zero. Until
-at least one component is assessed, output says `worthiness: not yet rated`; researched results are
+at least one component is assessed, output says `significance: not yet rated`; researched results are
 shown against the assessed portion of the rubric, for example `8/25 assessed points`.
 
 Later research will also collect information such as:
@@ -489,11 +501,16 @@ Each claim should retain:
 * confidence
 * research timestamp
 
-## Worthiness rubric
+## Separate derived scores
 
-The initial rubric is versioned and human-editable.
+`significance_score` asks how acclaimed, important, or historically notable a work is.
+`personal_read_score` asks how likely the owner is to value reading it now. The latter is explicitly
+unavailable until personal reading-history evidence is imported; significance is not presented as
+a personalized recommendation.
 
-Version 1.0 uses a 100-point scale:
+The significance rubric is versioned and human-editable.
+
+Version 2.0 currently defines these dimensions:
 
 | Component           | Maximum |
 | ------------------- | ------: |
@@ -502,28 +519,27 @@ Version 1.0 uses a 100-point scale:
 | Author significance |      15 |
 | Reader reception    |      10 |
 | Historical interest |      10 |
-| Personal interest   |      15 |
-| Discovery bonus     |       5 |
 
-Confidence is separate from worthiness.
+Confidence is separate from significance.
 
 For example:
 
 ```text
-worthiness: 82
+significance_score: 62
 confidence: 0.96
 ```
 
 and:
 
 ```text
-worthiness: 82
+significance_score: 62
 confidence: 0.42
 ```
 
 mean different things.
 
-Sparse evidence should not automatically make an obscure book less worthy.
+Sparse evidence should not automatically make an obscure book less significant. Scores are shown
+against assessed dimensions rather than treating every unknown component as zero.
 
 ## Local data
 

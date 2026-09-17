@@ -1,0 +1,16 @@
+version: "2.0"
+score_kind: significance
+components:
+  major_awards:
+    max: 25
+    rules:
+      win: 8
+      nomination: 3
+  critical_reputation:
+    max: 20
+  author_significance:
+    max: 15
+  reader_reception:
+    max: 10
+  historical_interest:
+    max: 10
