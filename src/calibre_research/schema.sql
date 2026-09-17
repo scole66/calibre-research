@@ -87,6 +87,22 @@ CREATE TABLE IF NOT EXISTS claim_evidence (
     PRIMARY KEY(claim_id, evidence_id)
 );
 
+CREATE TABLE IF NOT EXISTS award_evidence (
+    id INTEGER PRIMARY KEY,
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    award_name TEXT NOT NULL,
+    award_year INTEGER,
+    category TEXT,
+    result TEXT NOT NULL CHECK(result IN ('winner', 'finalist', 'nominee')),
+    source_name TEXT NOT NULL,
+    source_identifier TEXT NOT NULL,
+    source_url TEXT,
+    confidence REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'RESEARCHED',
+    retrieved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(work_id, source_name, source_identifier, result)
+);
+
 CREATE TABLE IF NOT EXISTS scores (
     id INTEGER PRIMARY KEY,
     work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
@@ -97,6 +113,31 @@ CREATE TABLE IF NOT EXISTS scores (
     why_read TEXT,
     scored_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(work_id, rubric_version)
+);
+
+-- Score kinds are kept separate so significance and personal preference can
+-- evolve independently. `scores` remains as a legacy table for old databases.
+CREATE TABLE IF NOT EXISTS derived_scores (
+    id INTEGER PRIMARY KEY,
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    score_kind TEXT NOT NULL,
+    rubric_version TEXT NOT NULL,
+    total REAL NOT NULL,
+    confidence REAL,
+    components_json TEXT NOT NULL,
+    explanation TEXT,
+    scored_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(work_id, score_kind, rubric_version)
+);
+
+CREATE TABLE IF NOT EXISTS significance_provider_attempts (
+    id INTEGER PRIMARY KEY,
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('MATCH', 'MISS', 'ERROR')),
+    error TEXT,
+    attempted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(work_id, provider)
 );
 
 CREATE TABLE IF NOT EXISTS review_queue (

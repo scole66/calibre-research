@@ -1,5 +1,5 @@
 database: ~/.local/share/calibre-research/research.sqlite3
-rubric: ./config/rubric-1.0.yaml
+rubric: ./config/significance-rubric-2.0.yaml
 
 research:
   max_cost_per_run_usd: 5.00
@@ -10,8 +10,17 @@ research:
     # Free, credential-free structured award and nomination research.
     enabled: true
     base_url: https://www.wikidata.org/w/api.php
+    # Wikimedia requires automated clients to provide current contact information.
+    contact: https://github.com/scole66/calibre-research
     timeout_seconds: 15.0
     max_candidates: 5
+    # Requests are serialized and conservatively paced. Retry-After always wins.
+    requests_per_second: 1.0
+    max_retries: 3
+    # Caps fallback backoff only; an explicit server Retry-After is honored in full.
+    retry_wait_max_seconds: 60.0
+    # Ask the Action API to defer this batch job when Wikimedia replicas are busy.
+    maxlag_seconds: 5
 
 metadata:
   # Providers listed here are enabled and tried in order. Later providers are

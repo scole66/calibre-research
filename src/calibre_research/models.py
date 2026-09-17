@@ -25,10 +25,22 @@ class SignificanceClaim(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
 
 
+class AwardEvidence(BaseModel):
+    award_name: str
+    year: int | None = None
+    category: str | None = None
+    result: str
+    source_name: str
+    source_identifier: str
+    source_url: HttpUrl | None = None
+    confidence: float = Field(ge=0, le=1)
+
+
 class ResearchResult(BaseModel):
     title: str
     author: str
     identity_confidence: float = Field(ge=0, le=1)
     facts: list[ResearchedFact] = Field(default_factory=list)
     claims: list[SignificanceClaim] = Field(default_factory=list)
+    awards: list[AwardEvidence] = Field(default_factory=list)
     estimated_cost_usd: float = 0.0
