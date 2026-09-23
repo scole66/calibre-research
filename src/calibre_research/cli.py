@@ -12,6 +12,7 @@ from rich.table import Table
 from .calibre import CalibreError, scan_library
 from .config import load_config
 from .db import Database
+from .goodreads import GoodreadsImportError, import_goodreads_csv
 from .metadata import build_proposals, candidate_from_normalized, classify_unresolved
 from .providers import ProviderError, make_metadata_provider, metadata_query_key
 from .scoring import assessed_maximum, load_rubric, score_significance
@@ -362,6 +363,11 @@ def stats(config: ConfigOpt = None):
                 "SELECT COUNT(*) FROM award_evidence WHERE status='RESEARCHED'"
             ).fetchone()[0],
             "Derived scores": con.execute("SELECT COUNT(*) FROM derived_scores").fetchone()[0],
+            "Source imports": con.execute("SELECT COUNT(*) FROM source_imports").fetchone()[0],
+            "Reading observations": con.execute(
+                "SELECT COUNT(*) FROM reading_status_observations"
+            ).fetchone()[0],
+            "Owned editions": con.execute("SELECT COUNT(*) FROM owned_editions").fetchone()[0],
             "Review queue": con.execute(
                 "SELECT COUNT(*) FROM review_queue WHERE status='OPEN'"
             ).fetchone()[0],
@@ -372,6 +378,28 @@ def stats(config: ConfigOpt = None):
     for key, value in values.items():
         table.add_row(key, str(value))
     console.print(table)
+
+
+@app.command("import-goodreads")
+def import_goodreads(
+    csv_path: Annotated[Path, typer.Argument(help="Goodreads library export CSV.")],
+    config: ConfigOpt = None,
+):
+    """Import Goodreads observations into the local evidence database."""
+    cfg = _load(config)
+    db = _db(cfg.database_path)
+    db.initialize()
+    try:
+        summary = import_goodreads_csv(db, csv_path)
+    except (GoodreadsImportError, OSError) as exc:
+        raise typer.Exit(code=_print_error(str(exc))) from exc
+    if summary.already_imported:
+        console.print(f"Goodreads export already imported; {summary.rows} rows unchanged.")
+        return
+    console.print(
+        f"Imported {summary.rows} Goodreads rows: {summary.matched} matched, "
+        f"{summary.created} works created, {summary.ambiguous} need review."
+    )
 
 
 @app.command()
@@ -568,20 +596,21 @@ def explain(query: str, config: ConfigOpt = None):
     console.print(f"[bold]{row['canonical_title']}[/bold] — {row['canonical_author']}")
     if row["total"] is None:
         console.print("Not scored yet.")
-        return
-    components = json.loads(row["components_json"])
-    assessed_max = assessed_maximum(components)
-    if assessed_max:
-        console.print(
-            f"Provisional significance: {_display_score(row['total'])}/"
-            f"{_display_score(assessed_max)} assessed points (rubric {row['rubric_version']})"
-        )
     else:
-        console.print(f"Significance: not yet rated (rubric {row['rubric_version']})")
-    console.print(f"Confidence: {row['confidence']}")
-    console.print(f"Significance evidence: {row['explanation'] or '-'}")
+        components = json.loads(row["components_json"])
+        assessed_max = assessed_maximum(components)
+        if assessed_max:
+            console.print(
+                f"Provisional significance: {_display_score(row['total'])}/"
+                f"{_display_score(assessed_max)} assessed points "
+                f"(rubric {row['rubric_version']})"
+            )
+        else:
+            console.print(f"Significance: not yet rated (rubric {row['rubric_version']})")
+        console.print(f"Confidence: {row['confidence']}")
+        console.print(f"Significance evidence: {row['explanation'] or '-'}")
+        console.print(json.dumps(components, indent=2))
     console.print("Personal read score: unavailable")
-    console.print(json.dumps(components, indent=2))
 
     with db.connect() as con:
         claims = con.execute(
@@ -612,6 +641,59 @@ def explain(query: str, config: ConfigOpt = None):
             """,
             (row["id"],),
         ).fetchall()
+        personal_history = con.execute(
+            """
+            SELECT si.source, si.imported_at, sr.source_record_id,
+                   rso.status, rso.date_read,
+                   ro.rating, ro.scale_max,
+                   oe.format, oe.isbn, oe.owned_count
+            FROM source_records sr
+            JOIN source_imports si ON si.id=sr.import_id
+            LEFT JOIN reading_status_observations rso ON rso.source_record_id=sr.id
+            LEFT JOIN rating_observations ro ON ro.source_record_id=sr.id
+            LEFT JOIN owned_editions oe ON oe.source_record_id=sr.id
+            WHERE sr.work_id=?
+            ORDER BY si.imported_at, sr.id
+            """,
+            (row["id"],),
+        ).fetchall()
+        tags = con.execute(
+            """
+            SELECT DISTINCT si.source, t.tag
+            FROM tag_observations t
+            JOIN source_records sr ON sr.id=t.source_record_id
+            JOIN source_imports si ON si.id=sr.import_id
+            WHERE t.work_id=?
+            ORDER BY si.source, t.tag
+            """,
+            (row["id"],),
+        ).fetchall()
+    if personal_history or tags:
+        console.print("[bold]Personal history[/bold]")
+        for item in personal_history:
+            details = []
+            if item["status"]:
+                details.append(f"status={item['status']}")
+            if item["date_read"]:
+                details.append(f"date read={item['date_read']}")
+            if item["rating"] is not None:
+                details.append(f"rating={item['rating']:g}/{item['scale_max']:g}")
+            if item["owned_count"] is not None:
+                owned = f"owned={item['owned_count']}"
+                if item["format"]:
+                    owned += f" {item['format']}"
+                details.append(owned)
+            if details:
+                console.print(
+                    f"  {item['source']}:{item['source_record_id']} "
+                    f"(imported {item['imported_at']}): " + "; ".join(details)
+                )
+        if tags:
+            grouped_tags: dict[str, list[str]] = {}
+            for tag in tags:
+                grouped_tags.setdefault(tag["source"], []).append(tag["tag"])
+            for source, source_tags in grouped_tags.items():
+                console.print(f"  {source} tags: {', '.join(source_tags)}")
     if awards:
         console.print("[bold]Award evidence[/bold]")
         for award in awards:

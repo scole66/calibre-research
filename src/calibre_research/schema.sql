@@ -140,6 +140,60 @@ CREATE TABLE IF NOT EXISTS significance_provider_attempts (
     UNIQUE(work_id, provider)
 );
 
+CREATE TABLE IF NOT EXISTS source_imports (
+    id INTEGER PRIMARY KEY,
+    source TEXT NOT NULL,
+    source_filename TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    row_count INTEGER NOT NULL,
+    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source, content_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS source_records (
+    id INTEGER PRIMARY KEY,
+    import_id INTEGER NOT NULL REFERENCES source_imports(id) ON DELETE CASCADE,
+    work_id INTEGER REFERENCES works(id) ON DELETE SET NULL,
+    source_record_id TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    match_status TEXT NOT NULL CHECK(match_status IN ('MATCHED', 'CREATED', 'AMBIGUOUS')),
+    match_method TEXT,
+    UNIQUE(import_id, source_record_id)
+);
+
+CREATE TABLE IF NOT EXISTS reading_status_observations (
+    id INTEGER PRIMARY KEY,
+    source_record_id INTEGER NOT NULL UNIQUE REFERENCES source_records(id) ON DELETE CASCADE,
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('unread', 'currently_reading', 'read', 'abandoned')),
+    date_read TEXT
+);
+
+CREATE TABLE IF NOT EXISTS rating_observations (
+    id INTEGER PRIMARY KEY,
+    source_record_id INTEGER NOT NULL UNIQUE REFERENCES source_records(id) ON DELETE CASCADE,
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    rating REAL NOT NULL,
+    scale_max REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS owned_editions (
+    id INTEGER PRIMARY KEY,
+    source_record_id INTEGER NOT NULL UNIQUE REFERENCES source_records(id) ON DELETE CASCADE,
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    format TEXT,
+    isbn TEXT,
+    owned_count INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS tag_observations (
+    id INTEGER PRIMARY KEY,
+    source_record_id INTEGER NOT NULL REFERENCES source_records(id) ON DELETE CASCADE,
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    UNIQUE(source_record_id, tag)
+);
+
 CREATE TABLE IF NOT EXISTS review_queue (
     id INTEGER PRIMARY KEY,
     work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,

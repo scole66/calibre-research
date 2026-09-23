@@ -29,6 +29,8 @@ Currently implemented:
 * bounded retry and request-pacing controls
 * command-based Google Books API-key resolution
 * structured Wikidata award and nomination research
+* idempotent, provenance-preserving Goodreads CSV imports
+* local reading-status, rating, ownership, and shelf observations
 * versioned scoring-rubric infrastructure
 * initial CLI commands
 * tests
@@ -38,7 +40,7 @@ Planned:
 
 * LLM-assisted significance research
 * confidence scoring and review queues
-* personal reading-history imports and `personal_read_score`
+* StoryGraph imports and `personal_read_score`
 * explicit synchronization of approved changes back to Calibre
 
 ## Requirements
@@ -206,6 +208,27 @@ Calibre's sentinel publication date:
 ```
 
 is treated as missing.
+
+## Import Goodreads history
+
+The local SQLite database is authoritative; Goodreads is an observation source rather than a
+synchronization target. Import a standard Goodreads library export with:
+
+```bash
+uv run calibre-research import-goodreads goodreads_library_export.csv
+```
+
+The importer matches ISBN first, then normalized title and author. As a conservative fallback it
+ignores only trailing numbered-series decorations such as `(The Stormlight Archive, #4)` when the
+author also matches. Unmatched rows create local works, and positive `Owned Copies` values create
+owned-edition records, including physical formats absent from Calibre. Ambiguous matches enter the
+review queue instead of being guessed into submission.
+
+Each distinct export is retained as an immutable import batch with its original rows. Re-importing
+the same file is a no-op; importing a later export adds new source-specific observations without
+erasing earlier reading statuses, ratings, ownership, or shelves. `explain` displays the accumulated
+personal history, but `personal_read_score` remains unavailable until deterministic personal scoring
+and series-continuity rules are implemented.
 
 ## Other CLI commands
 
