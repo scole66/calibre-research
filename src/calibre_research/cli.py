@@ -12,7 +12,11 @@ from rich.table import Table
 from .calibre import CalibreError, scan_library
 from .config import load_config
 from .db import Database
-from .goodreads import GoodreadsImportError, import_goodreads_csv
+from .goodreads import (
+    GoodreadsImportError,
+    import_goodreads_csv,
+    reconcile_goodreads_works,
+)
 from .metadata import build_proposals, candidate_from_normalized, classify_unresolved
 from .providers import ProviderError, make_metadata_provider, metadata_query_key
 from .scoring import assessed_maximum, load_rubric, score_significance
@@ -400,6 +404,58 @@ def import_goodreads(
         f"Imported {summary.rows} Goodreads rows: {summary.matched} matched, "
         f"{summary.created} works created, {summary.ambiguous} need review."
     )
+
+
+@app.command("reconcile-goodreads")
+def reconcile_goodreads(
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help="Merge safe duplicates. Without this flag, only show the plan.",
+        ),
+    ] = False,
+    config: ConfigOpt = None,
+):
+    """Reconcile Goodreads-created duplicates with Calibre-backed works."""
+    cfg = _load(config)
+    db = _db(cfg.database_path)
+    db.initialize()
+    summary = reconcile_goodreads_works(db, apply=apply)
+
+    if not summary.candidates:
+        console.print("No Goodreads-created duplicates match Calibre-backed works.")
+        return
+
+    table = Table(title="Goodreads reconciliation")
+    table.add_column("Goodreads work")
+    table.add_column("Calibre work")
+    table.add_column("Match")
+    table.add_column("Action")
+    for candidate in summary.candidates:
+        source = f"{candidate.source_work_id}: {candidate.source_title}"
+        target = (
+            f"{candidate.target_work_id}: {candidate.target_title}"
+            if candidate.target_work_id is not None
+            else "multiple matches"
+        )
+        if candidate.blocked_reason:
+            action = f"blocked: {candidate.blocked_reason}"
+        elif apply:
+            action = f"merged ({candidate.source_records} source records)"
+        else:
+            action = f"would merge ({candidate.source_records} source records)"
+        table.add_row(source, target, candidate.match_method, action)
+    console.print(table)
+    if apply:
+        console.print(
+            f"Merged {summary.applied} duplicate works; {summary.blocked} require review."
+        )
+    else:
+        console.print(
+            f"Dry run: {summary.ready} duplicates can be merged; "
+            f"{summary.blocked} require review. Re-run with --apply to merge safe matches."
+        )
 
 
 @app.command()
