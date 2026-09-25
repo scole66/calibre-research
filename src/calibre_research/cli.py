@@ -486,13 +486,14 @@ def research(
         retry_error_providers=enabled_significance_providers,
     )
     console.print(
-        f"Significance research from cached metadata; rubric={rubric_version}; "
-        f"cost=$0.00; candidates={len(rows)}"
+        f"Significance research; rubric={rubric_version}; cost=$0.00; candidates={len(rows)}"
     )
     if effective_budget < 0:
         raise typer.Exit(code=_print_error("Research budget cannot be negative"))
     if not rows:
-        console.print("No works with current metadata matches require scoring.")
+        console.print(
+            f"No eligible works require significance scoring for rubric {rubric_version}."
+        )
         return
 
     wikidata = (

@@ -230,6 +230,11 @@ erasing earlier reading statuses, ratings, ownership, or shelves. `explain` disp
 personal history, but `personal_read_score` remains unavailable until deterministic personal scoring
 and series-continuity rules are implemented.
 
+Goodreads-linked works are eligible for significance research even when they have no Calibre edition
+or cached metadata match. Goodreads establishes that the work belongs in the research population;
+it does not count as significance evidence. Significance remains derived from independent sources
+such as structured award data.
+
 Exports imported before the numbered-series matching rule may have created duplicate works. Preview
 a conservative repair plan with:
 
