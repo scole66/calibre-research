@@ -4,7 +4,7 @@ from typer.testing import CliRunner
 
 import calibre_research.cli as cli_module
 from calibre_research.db import Database
-from calibre_research.goodreads import import_goodreads_csv
+from calibre_research.goodreads import import_goodreads_csv, reconcile_goodreads_works
 
 CSV_HEADER = (
     "Book Id,Title,Author,ISBN,ISBN13,My Rating,Binding,Original Publication Year,"
@@ -194,3 +194,113 @@ def test_goodreads_cli_import_and_explain(tmp_path: Path):
     assert "goodreads tags: fantasy, urban-fantasy" in explained.output
     assert repeated.exit_code == 0, repeated.output
     assert "already imported" in repeated.output
+
+
+def test_reconcile_goodreads_merges_safe_historical_duplicate(tmp_path: Path):
+    database = Database(tmp_path / "reconcile.sqlite3")
+    database.initialize()
+    export = tmp_path / "old-import.csv"
+    export.write_text(
+        CSV_HEADER + '49021976,"Rhythm of War (The Stormlight Archive, #4)",Brandon Sanderson,,'
+        '="9780765326386",4,Hardcover,2020,2026/09/08,cosmere,read,1\n'
+    )
+    imported = import_goodreads_csv(database, export)
+    assert imported.created == 1
+    calibre = database.upsert_calibre_book(
+        "/library",
+        {"id": "551", "title": "Rhythm of War", "authors": ["Brandon Sanderson"]},
+    )
+    assert calibre.work_id is not None
+
+    preview = reconcile_goodreads_works(database)
+    applied = reconcile_goodreads_works(database, apply=True)
+
+    assert preview.ready == 1
+    assert preview.blocked == 0
+    assert applied.applied == 1
+    with database.connect() as con:
+        works = con.execute("SELECT id, canonical_title FROM works").fetchall()
+        record = con.execute(
+            "SELECT work_id, match_status, match_method FROM source_records"
+        ).fetchone()
+        history = con.execute(
+            """
+            SELECT r.status, r.date_read, o.rating, e.owned_count, t.tag
+            FROM reading_status_observations r
+            JOIN rating_observations o ON o.source_record_id=r.source_record_id
+            JOIN owned_editions e ON e.source_record_id=r.source_record_id
+            JOIN tag_observations t ON t.source_record_id=r.source_record_id
+            """
+        ).fetchone()
+    assert [dict(row) for row in works] == [
+        {"id": calibre.work_id, "canonical_title": "Rhythm of War"}
+    ]
+    assert dict(record) == {
+        "work_id": calibre.work_id,
+        "match_status": "MATCHED",
+        "match_method": "reconciled_title_author_without_series_suffix",
+    }
+    assert dict(history) == {
+        "status": "read",
+        "date_read": "2026/09/08",
+        "rating": 4.0,
+        "owned_count": 1,
+        "tag": "cosmere",
+    }
+
+
+def test_reconcile_goodreads_refuses_researched_duplicate(tmp_path: Path):
+    database = Database(tmp_path / "blocked.sqlite3")
+    database.initialize()
+    export = tmp_path / "old-import.csv"
+    export.write_text(
+        CSV_HEADER + '1,"Dune (Dune, #1)",Frank Herbert,,,5,Paperback,1965,,,read,0\n'
+    )
+    import_goodreads_csv(database, export)
+    database.upsert_calibre_book(
+        "/library", {"id": "1", "title": "Dune", "authors": ["Frank Herbert"]}
+    )
+    with database.connect() as con:
+        duplicate_id = con.execute(
+            "SELECT id FROM works WHERE canonical_title LIKE 'Dune (%'"
+        ).fetchone()["id"]
+        con.execute(
+            """
+            INSERT INTO facts(work_id, field_name, value_json, confidence)
+            VALUES (?, 'test', 'true', 1.0)
+            """,
+            (duplicate_id,),
+        )
+
+    result = reconcile_goodreads_works(database, apply=True)
+
+    assert result.applied == 0
+    assert result.blocked == 1
+    assert result.candidates[0].blocked_reason == "has non-Goodreads data in facts"
+    with database.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 2
+
+
+def test_reconcile_goodreads_cli_defaults_to_dry_run(tmp_path: Path):
+    database_path = tmp_path / "cli-reconcile.sqlite3"
+    database = Database(database_path)
+    database.initialize()
+    export = tmp_path / "old-import.csv"
+    export.write_text(
+        CSV_HEADER + '1,"Dune (Dune, #1)",Frank Herbert,,,5,Paperback,1965,,,read,0\n'
+    )
+    import_goodreads_csv(database, export)
+    database.upsert_calibre_book(
+        "/library", {"id": "1", "title": "Dune", "authors": ["Frank Herbert"]}
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"database: {database_path}\n")
+
+    result = CliRunner().invoke(
+        cli_module.app, ["reconcile-goodreads", "--config", str(config_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Dry run: 1 duplicates can be merged" in result.output
+    with database.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 2

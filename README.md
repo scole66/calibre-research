@@ -230,6 +230,18 @@ erasing earlier reading statuses, ratings, ownership, or shelves. `explain` disp
 personal history, but `personal_read_score` remains unavailable until deterministic personal scoring
 and series-continuity rules are implemented.
 
+Exports imported before the numbered-series matching rule may have created duplicate works. Preview
+a conservative repair plan with:
+
+```bash
+uv run calibre-research reconcile-goodreads
+```
+
+The command only proposes merging a Goodreads-created work with no edition into a uniquely matching
+Calibre-backed work. It refuses to merge works with research data or ambiguous matches. After
+reviewing the plan, apply the safe merges with `reconcile-goodreads --apply`. Source rows and personal
+observations are reassigned to the Calibre-backed work; the redundant work is then removed.
+
 ## Other CLI commands
 
 Show database statistics:

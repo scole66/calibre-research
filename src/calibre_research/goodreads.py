@@ -26,6 +26,34 @@ class GoodreadsImportSummary:
     already_imported: bool = False
 
 
+@dataclass(frozen=True)
+class GoodreadsReconciliation:
+    source_work_id: int
+    source_title: str
+    target_work_id: int | None
+    target_title: str | None
+    match_method: str
+    source_records: int
+    blocked_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class GoodreadsReconciliationSummary:
+    candidates: tuple[GoodreadsReconciliation, ...]
+    applied: int = 0
+
+    @property
+    def ready(self) -> int:
+        return sum(
+            candidate.target_work_id is not None and candidate.blocked_reason is None
+            for candidate in self.candidates
+        )
+
+    @property
+    def blocked(self) -> int:
+        return len(self.candidates) - self.ready
+
+
 def import_goodreads_csv(database: Database, path: Path) -> GoodreadsImportSummary:
     content = path.read_bytes()
     digest = hashlib.sha256(content).hexdigest()
@@ -147,6 +175,170 @@ def import_goodreads_csv(database: Database, path: Path) -> GoodreadsImportSumma
     return GoodreadsImportSummary(
         rows=len(rows), matched=matched, created=created, ambiguous=ambiguous
     )
+
+
+def reconcile_goodreads_works(
+    database: Database, *, apply: bool = False
+) -> GoodreadsReconciliationSummary:
+    """Find and optionally merge safe Goodreads-created duplicate works.
+
+    Automatic reconciliation is deliberately limited to Goodreads-created works
+    without editions and a unique match to a Calibre-backed work. Works that
+    already have research attached are reported but never merged automatically.
+    """
+    with database.connect() as con:
+        target_title_author, target_series, target_isbns = _calibre_work_indexes(con)
+        rows = con.execute(
+            """
+            SELECT w.id, w.canonical_title, w.canonical_author,
+                   COUNT(DISTINCT sr.id) AS source_records
+            FROM works w
+            JOIN source_records sr ON sr.work_id=w.id
+            WHERE sr.match_status='CREATED'
+              AND NOT EXISTS (SELECT 1 FROM editions e WHERE e.work_id=w.id)
+            GROUP BY w.id
+            ORDER BY w.canonical_author, w.canonical_title, w.id
+            """
+        ).fetchall()
+        candidates: list[GoodreadsReconciliation] = []
+        for row in rows:
+            isbns = {
+                normalized
+                for isbn_row in con.execute(
+                    "SELECT isbn FROM owned_editions WHERE work_id=? AND isbn IS NOT NULL",
+                    (row["id"],),
+                )
+                if (normalized := normalize_isbn(isbn_row["isbn"]))
+            }
+            matches: set[int] = set()
+            method = "title_author"
+            for isbn in isbns:
+                matches.update(target_isbns.get(isbn, set()))
+            if matches:
+                method = "isbn"
+            else:
+                matches, method = _match_work(
+                    title=row["canonical_title"],
+                    author=row["canonical_author"],
+                    isbn=None,
+                    title_author_map=target_title_author,
+                    series_title_author_map=target_series,
+                    isbn_map=target_isbns,
+                )
+
+            if not matches:
+                continue
+
+            target_id = next(iter(matches)) if len(matches) == 1 else None
+            target_title = None
+            blocked_reason = None
+            if len(matches) > 1:
+                blocked_reason = (
+                    f"matches multiple Calibre works: {', '.join(map(str, sorted(matches)))}"
+                )
+            elif target_id is not None:
+                target_title = con.execute(
+                    "SELECT canonical_title FROM works WHERE id=?", (target_id,)
+                ).fetchone()["canonical_title"]
+                blocked_reason = _automatic_merge_blocker(con, row["id"])
+            candidates.append(
+                GoodreadsReconciliation(
+                    source_work_id=row["id"],
+                    source_title=row["canonical_title"],
+                    target_work_id=target_id,
+                    target_title=target_title,
+                    match_method=method,
+                    source_records=row["source_records"],
+                    blocked_reason=blocked_reason,
+                )
+            )
+
+        applied = 0
+        if apply:
+            for candidate in candidates:
+                if candidate.target_work_id is None or candidate.blocked_reason is not None:
+                    continue
+                _merge_goodreads_work(
+                    con,
+                    source_work_id=candidate.source_work_id,
+                    target_work_id=candidate.target_work_id,
+                    method=candidate.match_method,
+                )
+                applied += 1
+
+    return GoodreadsReconciliationSummary(tuple(candidates), applied=applied)
+
+
+def _calibre_work_indexes(con):
+    title_author: dict[tuple[str, str], set[int]] = {}
+    series_title_author: dict[tuple[str, str], set[int]] = {}
+    for row in con.execute(
+        """
+        SELECT DISTINCT w.id, w.canonical_title, w.canonical_author
+        FROM works w JOIN editions e ON e.work_id=w.id
+        """
+    ):
+        key = (normalize_text(row["canonical_title"]), normalize_text(row["canonical_author"]))
+        title_author.setdefault(key, set()).add(row["id"])
+        series_key = _series_title_author_key(
+            title=row["canonical_title"], author=row["canonical_author"]
+        )
+        if series_key is not None:
+            series_title_author.setdefault(series_key, set()).add(row["id"])
+    isbn_map: dict[str, set[int]] = {}
+    for row in con.execute(
+        """
+        SELECT e.work_id, e.isbn FROM editions e
+        WHERE e.isbn IS NOT NULL AND e.isbn != ''
+        """
+    ):
+        if isbn := normalize_isbn(row["isbn"]):
+            isbn_map.setdefault(isbn, set()).add(row["work_id"])
+    return title_author, series_title_author, isbn_map
+
+
+def _automatic_merge_blocker(con, work_id: int) -> str | None:
+    protected_tables = (
+        "editions",
+        "evidence",
+        "facts",
+        "significance_claims",
+        "award_evidence",
+        "scores",
+        "derived_scores",
+        "significance_provider_attempts",
+    )
+    populated = [
+        table
+        for table in protected_tables
+        if con.execute(f"SELECT 1 FROM {table} WHERE work_id=? LIMIT 1", (work_id,)).fetchone()
+    ]
+    if populated:
+        return "has non-Goodreads data in " + ", ".join(populated)
+    return None
+
+
+def _merge_goodreads_work(con, *, source_work_id: int, target_work_id: int, method: str) -> None:
+    for table in (
+        "reading_status_observations",
+        "rating_observations",
+        "owned_editions",
+        "tag_observations",
+        "review_queue",
+    ):
+        con.execute(
+            f"UPDATE {table} SET work_id=? WHERE work_id=?",
+            (target_work_id, source_work_id),
+        )
+    con.execute(
+        """
+        UPDATE source_records
+        SET work_id=?, match_status='MATCHED', match_method=?
+        WHERE work_id=?
+        """,
+        (target_work_id, f"reconciled_{method}", source_work_id),
+    )
+    con.execute("DELETE FROM works WHERE id=?", (source_work_id,))
 
 
 def _work_indexes(
