@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from calibre_research.db import Database
+from calibre_research.goodreads import import_goodreads_csv
 from calibre_research.metadata import MetadataCandidate, metadata_query_key
 from calibre_research.models import ResearchResult
 from calibre_research.providers import ProviderError
@@ -269,6 +270,72 @@ rubric: {RUBRIC_PATH}
             == 1
         )
         assert con.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 1
+
+
+def test_significance_cli_researches_goodreads_work_without_calibre_edition(
+    tmp_path: Path, monkeypatch
+):
+    from typer.testing import CliRunner
+
+    import calibre_research.cli as cli_module
+
+    database_path = tmp_path / "goodreads-significance.sqlite3"
+    db = Database(database_path)
+    db.initialize()
+    export = tmp_path / "goodreads.csv"
+    export.write_text(
+        "Book Id,Title,Author,Exclusive Shelf,My Rating,Owned Copies\n"
+        "42,The Left Hand of Darkness,Ursula K. Le Guin,to-read,0,0\n"
+    )
+    imported = import_goodreads_csv(db, export)
+    assert imported.created == 1
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""database: {database_path}
+rubric: {RUBRIC_PATH}
+research:
+  wikidata:
+    enabled: true
+    requests_per_second: 0
+"""
+    )
+    calls: list[tuple[str, str]] = []
+
+    def research_miss(self, *, title, author):
+        calls.append((title, author))
+        return ResearchResult(title=title, author=author, identity_confidence=0.0)
+
+    monkeypatch.setattr(
+        "calibre_research.cli.WikidataAwardProvider.research",
+        research_miss,
+    )
+    runner = CliRunner()
+
+    researched = runner.invoke(
+        cli_module.app,
+        ["research", "--depth", "significance", "--config", str(config_path)],
+    )
+    repeated = runner.invoke(
+        cli_module.app,
+        ["research", "--depth", "significance", "--config", str(config_path)],
+    )
+
+    assert researched.exit_code == 0, researched.output
+    assert "candidates=1" in researched.output
+    assert "The Left Hand of Darkness" in researched.output
+    assert calls == [("The Left Hand of Darkness", "Ursula K. Le Guin")]
+    assert repeated.exit_code == 0, repeated.output
+    assert "candidates=0" in repeated.output
+    assert "No eligible works require significance scoring for rubric 2.0." in repeated.output
+    with db.connect() as con:
+        score = con.execute(
+            """
+            SELECT ds.score_kind, ds.rubric_version
+            FROM derived_scores ds
+            JOIN source_records sr ON sr.work_id=ds.work_id
+            """
+        ).fetchone()
+    assert dict(score) == {"score_kind": "significance", "rubric_version": "2.0"}
 
 
 def test_significance_cli_retries_provider_errors_on_next_ordinary_run(tmp_path: Path, monkeypatch):

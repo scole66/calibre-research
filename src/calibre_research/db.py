@@ -407,13 +407,21 @@ class Database:
             SELECT w.id AS work_id, w.canonical_title AS title,
                    w.canonical_author AS author
             FROM works w
-            WHERE EXISTS (
-                SELECT 1
-                FROM editions e
-                JOIN metadata_lookups ml ON ml.edition_id=e.id
-                WHERE e.work_id=w.id
-                  AND ml.status='MATCH'
-                  AND ml.query_key=metadata_query_key(e.title, e.author, e.isbn)
+            WHERE (
+                EXISTS (
+                    SELECT 1
+                    FROM editions e
+                    JOIN metadata_lookups ml ON ml.edition_id=e.id
+                    WHERE e.work_id=w.id
+                      AND ml.status='MATCH'
+                      AND ml.query_key=metadata_query_key(e.title, e.author, e.isbn)
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM source_records sr
+                    JOIN source_imports si ON si.id=sr.import_id
+                    WHERE sr.work_id=w.id AND si.source='goodreads'
+                )
             )
         """
         params: list[Any] = []
