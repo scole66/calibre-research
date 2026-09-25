@@ -637,19 +637,22 @@ def explain(query: str, config: ConfigOpt = None):
     cfg = _load(config)
     db = _db(cfg.database_path)
     db.initialize()
+    query = query.strip()
+    if not query:
+        raise typer.Exit(code=_print_error("Work title cannot be empty"))
     with db.connect() as con:
-        row = con.execute(
-            """
-            SELECT w.id, w.canonical_title, w.canonical_author, s.*
-            FROM works w LEFT JOIN derived_scores s
-              ON s.work_id=w.id AND s.score_kind='significance'
-            WHERE lower(w.canonical_title) LIKE lower(?)
-            ORDER BY s.scored_at DESC LIMIT 1
-            """,
-            (f"%{query}%",),
-        ).fetchone()
-    if not row:
+        rows = _explain_matches(con, query=query, exact=True)
+        if not rows:
+            rows = _explain_matches(con, query=query, exact=False)
+    if not rows:
         raise typer.Exit(code=_print_error("No matching work"))
+    if len(rows) > 1:
+        console.print(f"[red]error:[/red] Multiple works match {query!r}:")
+        for match in rows:
+            console.print(f"  {match['canonical_title']} — {match['canonical_author']}")
+        console.print("Use a more specific title.")
+        raise typer.Exit(code=1)
+    row = rows[0]
     console.print(f"[bold]{row['canonical_title']}[/bold] — {row['canonical_author']}")
     if row["total"] is None:
         console.print("Not scored yet.")
@@ -768,6 +771,30 @@ def explain(query: str, config: ConfigOpt = None):
         for item in evidence:
             label = item["source_name"] or item["citation_text"] or "Source"
             console.print(f"  {label}: {item['source_url'] or '-'}")
+
+
+def _explain_matches(con, *, query: str, exact: bool):
+    comparison = (
+        "lower(w.canonical_title) = lower(?)"
+        if exact
+        else "instr(lower(w.canonical_title), lower(?)) > 0"
+    )
+    return con.execute(
+        f"""
+        SELECT w.id, w.canonical_title, w.canonical_author, s.*
+        FROM works w
+        LEFT JOIN derived_scores s ON s.id = (
+            SELECT latest.id
+            FROM derived_scores latest
+            WHERE latest.work_id=w.id AND latest.score_kind='significance'
+            ORDER BY latest.scored_at DESC, latest.id DESC
+            LIMIT 1
+        )
+        WHERE {comparison}
+        ORDER BY lower(w.canonical_title), lower(w.canonical_author), w.id
+        """,
+        (query,),
+    ).fetchall()
 
 
 def _print_metadata_header(edition: dict) -> None:
