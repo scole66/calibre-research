@@ -649,11 +649,13 @@ def explain(query: str, config: ConfigOpt = None):
     if len(rows) > 1:
         console.print(f"[red]error:[/red] Multiple works match {query!r}:")
         for match in rows:
-            console.print(f"  {match['canonical_title']} — {match['canonical_author']}")
+            console.print(f"  {match['id']}: {_explain_work_label(match)}")
         console.print("Use a more specific title.")
         raise typer.Exit(code=1)
     row = rows[0]
-    console.print(f"[bold]{row['canonical_title']}[/bold] — {row['canonical_author']}")
+    console.print(
+        f"[bold]{row['canonical_title']}[/bold] — {row['canonical_author']} ({_work_origin(row)})"
+    )
     if row["total"] is None:
         console.print("Not scored yet.")
     else:
@@ -781,7 +783,20 @@ def _explain_matches(con, *, query: str, exact: bool):
     )
     return con.execute(
         f"""
-        SELECT w.id, w.canonical_title, w.canonical_author, s.*
+        SELECT w.id, w.canonical_title, w.canonical_author, s.*,
+               EXISTS (
+                   SELECT 1 FROM editions e WHERE e.work_id=w.id
+               ) AS has_calibre,
+               (
+                   SELECT group_concat(import_source.source, '+')
+                   FROM (
+                       SELECT DISTINCT si.source
+                       FROM source_records sr
+                       JOIN source_imports si ON si.id=sr.import_id
+                       WHERE sr.work_id=w.id
+                       ORDER BY si.source
+                   ) AS import_source
+               ) AS import_sources
         FROM works w
         LEFT JOIN derived_scores s ON s.id = (
             SELECT latest.id
@@ -795,6 +810,17 @@ def _explain_matches(con, *, query: str, exact: bool):
         """,
         (query,),
     ).fetchall()
+
+
+def _explain_work_label(row) -> str:
+    return f"{row['canonical_title']} — {row['canonical_author']} ({_work_origin(row)})"
+
+
+def _work_origin(row) -> str:
+    origins = ["calibre"] if row["has_calibre"] else []
+    if row["import_sources"]:
+        origins.extend(str(row["import_sources"]).split("+"))
+    return "+".join(origins) if origins else "local"
 
 
 def _print_metadata_header(edition: dict) -> None:
